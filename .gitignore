@@ -26,3 +26,23 @@ pc_app/debug_*.txt
 
 # Private project notes - kept on this PC only, never uploaded
 CLAUDE.md
+
+# Kept on this PC only: diagnostics, old experiments, tools and notes that
+# aren't part of the working app or firmware
+docs/
+dash_display/
+hx711_diag/
+pin_wiggle/
+serial_test/
+tft_diag/
+pc_app/ffb_diagnostic_log.py
+pc_app/ffbeast_pid.py
+pc_app/hid_pid_wheelbase_test.py
+pc_app/forza_to_esp32_dash.py
+pc_app/rf2_to_nano_dash.py
+pc_app/pid_wheelbase_api.py
+pc_app/volgas_flasher.py
+pc_app/VolgasFlasher.spec
+pc_app/firmware/
+pc_app/PedalControl.spec
+pc_app/assets/make_icon.py
