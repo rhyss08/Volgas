@@ -1,0 +1,25 @@
+# Build output - released exes go on GitHub Releases, not in the repo
+build/
+pc_app/dist/
+__pycache__/
+*.pyc
+
+# Downloaded tooling and other projects' repositories
+toolchain/
+wheelbase_firmware/
+
+# Third-party programs and images that can't be redistributed
+pc_app/assets/vJoy-2.2.1.1/
+pc_app/assets/forza_emuwheel_v1.4a/
+pc_app/assets/image_5e9bfec6.png
+pc_app/assets/diy-audi-dtm-steering-wheel-2.webp
+
+# Local data and run logs
+pc_app/ffb_log_*.csv
+volgas_settings.json
+*.log
+pc_app/debug_*.txt
+
+# Editor / OS / tool files
+.DS_Store
+.claude/
