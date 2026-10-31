@@ -18,6 +18,41 @@ import subprocess
 import sys
 import threading
 import time
+
+
+def _process_image(pid):
+    """Full exe path of a running process, or None if it can't be read."""
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(len(buf))
+        return buf.value if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)) else None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _restart_if_borrowing_unpack_folder():
+    """Updates from 0.2.3 and older start the new exe without the reset in
+    _install_update, so it runs from the old process's unpack folder. A
+    normal onefile start has its own bootloader (the same exe) as parent;
+    here the parent is the old Volgas.exe.old, so start again cleanly and
+    let this copy exit before the old folder disappears. Runs before the
+    rest of the imports, which load files from that folder."""
+    if not getattr(sys, "frozen", False) or os.environ.get("VOLGAS_RESTARTED"):
+        return
+    parent = _process_image(os.getppid())
+    if parent and os.path.normcase(parent) == os.path.normcase(sys.executable):
+        return
+    subprocess.Popen([sys.executable], close_fds=True,
+                     env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1", "VOLGAS_RESTARTED": "1"})
+    sys.exit(0)
+
+
+_restart_if_borrowing_unpack_folder()
+
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -47,7 +82,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.2.3"
+VOLGAS_VERSION = "0.2.4"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -119,7 +154,13 @@ def _install_update(new_path):
         os.remove(old)
     os.rename(exe, old)
     os.rename(new_path, exe)
-    subprocess.Popen([exe], close_fds=True)
+    # Without the reset, the new exe - at the path this one was started from -
+    # takes the inherited _PYI_* variables as its own and runs from this
+    # process's unpack folder, which is deleted when this one exits (seen on
+    # the 0.2.2 update: "Failed to remove temporary directory", then
+    # FileNotFoundError for the assets).
+    subprocess.Popen([exe], close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
+
 
 
 def _settings_path():
