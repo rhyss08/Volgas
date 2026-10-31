@@ -100,6 +100,14 @@ class DashBridge:
     def __init__(self, status_cb=lambda msg: None, forza_port=None):
         self.status_cb = status_cb
         self.forza_port = forza_port   # UDP port for Forza; None = ForzaUDPReader.DEFAULT_PORT
+        # What the dash was last sent, for the app's Dashboard preview, which
+        # rebuilds the screen from it. Values are (time.monotonic(), data)
+        # tuples, replaced whole so another thread can read them safely.
+        self.connected = False
+        self.time_synced = False   # a time sync went out on this connection
+        self.last_telemetry = None   # (t, (speed_kph, rpm, rpm_max, gear))
+        self.last_lap_time = None    # (t, (lap_time_ms, valid))
+        self.last_lap_delta = None   # (t, (delta_ms, valid))
 
     def run(self, stop_event):
         # Same outer-retry-loop shape as volgas_rf2_dash.DashBridge/
@@ -121,7 +129,9 @@ class DashBridge:
 
                 self.status_cb(f"found dash on {port}")
                 ser = serial.Serial(port, 115200, timeout=0.05)
+                self.connected = True
                 send_time_sync_burst(ser, stop_event)
+                self.time_synced = True
                 last_time_sync = time.time()
 
                 forza_kwargs = {} if self.forza_port is None else {"port": self.forza_port}
@@ -174,6 +184,7 @@ class DashBridge:
                         gear = max(-128, min(127, pt.gear))
                         payload = struct.pack(TELEMETRY_FMT, speed_kph, rpm, rpm_max, gear)
                         ser.write(build_frame(MSG_DASH_TELEMETRY, payload))
+                        self.last_telemetry = (time.monotonic(), (speed_kph, rpm, rpm_max, gear))
                         sent += 1
                         last_active_source = source
 
@@ -186,6 +197,7 @@ class DashBridge:
                                 lap_time_ms = max(0, min(0xFFFFFFFF, round(timing.lap_time_s * 1000)))
                                 lap_valid = 1 if timing.count_lap_flag == 2 else 0
                                 ser.write(build_frame(MSG_LAP_TIME, struct.pack(LAP_TIME_FMT, lap_time_ms, lap_valid)))
+                                self.last_lap_time = (time.monotonic(), (lap_time_ms, lap_valid))
 
                                 lap_recorder.update(timing.lap_dist, timing.lap_time_s, timing.total_laps, lap_valid == 1)
 
@@ -206,6 +218,7 @@ class DashBridge:
                                 delta_valid = 1 if delta_s is not None else 0
                                 delta_ms = max(-2**31, min(2**31 - 1, round(delta_s * 1000))) if delta_s is not None else 0
                                 ser.write(build_frame(MSG_LAP_DELTA, struct.pack(LAP_DELTA_FMT, delta_ms, delta_valid)))
+                                self.last_lap_delta = (time.monotonic(), (delta_ms, delta_valid))
                         # source == "forza": no MSG_LAP_TIME/MSG_LAP_DELTA at
                         # all - see this module's docstring.
 
@@ -232,6 +245,8 @@ class DashBridge:
                 self.status_cb(f"lost connection to the dash ({e}) - reconnecting...")
                 stop_event.wait(2)
             finally:
+                self.connected = False
+                self.time_synced = False
                 if ser:
                     ser.close()
                 if rf2_reader:

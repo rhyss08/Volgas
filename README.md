@@ -16,6 +16,7 @@ box steering wheel and a small dash display.
 
 - **Main**: live throttle and brake bars, plus the wheel card.
 - **Pedals**: live readings, a calibration wizard and response curves. The pedals are found automatically over USB.
+- **Dashboard**: a live picture of what the dash screen is showing.
 - **Wheelbase**: settings sliders. Wheelbase support isn't available yet; it will come with Volgas's own wheelbase firmware.
 - **Dash bridge**: runs in the background and sends rFactor 2 or Forza Horizon 5 telemetry to the dash, whichever game is running.
 - **Settings**: click the Volgas logo in the title bar. This shows the version and checks for and installs updates.
@@ -46,3 +47,8 @@ Volgas is released under the [GNU General Public License v3](LICENSE).
 
 `esp32_dash` and `wheel_tx` use the [RF24](https://github.com/nRF24/RF24) library,
 which is licensed separately under GPL v2.
+
+The Dashboard tab's preview uses the 5x7 font from the
+[Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library),
+Copyright (c) 2012 Adafruit Industries, under the BSD licence. The full notice is in
+[`pc_app/volgas_dash_font.py`](pc_app/volgas_dash_font.py).

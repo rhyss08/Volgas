@@ -28,7 +28,9 @@ import certifi
 import serial
 import serial.tools.list_ports
 from collections import deque
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
+
+import volgas_dash_font
 
 try:
     # volgas_dash_bridge.py auto-picks rFactor2 or Forza Horizon 5, whichever is
@@ -45,7 +47,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.2.1"
+VOLGAS_VERSION = "0.2.2"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -466,6 +468,92 @@ def _hook_caption(root):
         return None
 
 
+# ---- Dashboard tab preview: a copy of esp32_dash.ino's screen drawing ----
+# Rebuilt on the PC from what the dash bridge last sent, using the same
+# layout numbers, colours and 5x7 font as the firmware. Only the dash knows
+# its wheel radio link and held buttons, so the Standby wheel status shows
+# as "--" and the buttons line stays blank.
+DASH_SIZE = 128
+DASH_PREVIEW_SCALE = 3
+DASH_RPM_BAR_H = 14
+DASH_FOOTER_H = 46
+DASH_TELEMETRY_TIMEOUT_S = 1.0  # TELEMETRY_TIMEOUT_MS: Classic screen while telemetry is this fresh
+DASH_FOOTER_TIMEOUT_S = 1.5     # FOOTER_DATA_TIMEOUT_MS: lap-time footer while lap times are this fresh
+DASH_PREVIEW_MS = 50            # the bridge sends at 20 Hz
+DASH_WHITE, DASH_GREEN, DASH_RED, DASH_YELLOW = (255, 255, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)
+DASH_UNKNOWN = (110, 110, 110)
+DASH_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _dash_text(draw, x, y, text, size, color):
+    """Adafruit GFX's classic-font print(): 6*size px per character, each
+    font pixel a size x size block."""
+    glyphs = volgas_dash_font.GLYPHS
+    for k, ch in enumerate(text):
+        code = ord(ch) - volgas_dash_font.FIRST_CHAR
+        if not 0 <= code < len(glyphs) // 5:
+            continue
+        cx = x + k * 6 * size
+        for i in range(5):
+            column = glyphs[code * 5 + i]
+            for j in range(8):
+                if column >> j & 1:
+                    draw.rectangle((cx + i * size, y + j * size,
+                                    cx + (i + 1) * size - 1, y + (j + 1) * size - 1), fill=color)
+
+
+def _render_dash(state):
+    """The dash's 128x128 screen as an RGB image. state is
+    ("classic", (speed_kph, rpm, rpm_max, gear), lap or None, delta or None)
+    with lap = (lap_time_ms, valid) / delta = (delta_ms, valid), or
+    ("standby", has_time, app_connected, (weekday, hour, minute))."""
+    img = Image.new("RGB", (DASH_SIZE, DASH_SIZE))
+    draw = ImageDraw.Draw(img)
+    mid = DASH_SIZE // 2
+    if state[0] == "classic":
+        _, (speed, rpm, rpm_max, gear), lap, delta = state
+        footer_h = DASH_FOOTER_H if lap else 0
+        half = max(0, min(mid, rpm * mid // rpm_max)) if rpm_max else 0
+        frac = rpm / rpm_max if rpm_max else 0
+        bar_color = DASH_RED if frac > 0.92 else DASH_YELLOW if frac > 0.75 else DASH_GREEN
+        if half:
+            draw.rectangle((mid - half, 0, mid + half - 1, DASH_RPM_BAR_H - 1), fill=bar_color)
+        col_h = DASH_SIZE - DASH_RPM_BAR_H - footer_h
+        gear_char = "R" if gear < 0 else "N" if gear == 0 else chr(ord("0") + gear)
+        _dash_text(draw, (mid - 6 * 7) // 2, DASH_RPM_BAR_H + (col_h - 8 * 7) // 2, gear_char, 7, DASH_WHITE)
+        _dash_text(draw, mid + (mid - 3 * 6 * 3) // 2, DASH_RPM_BAR_H + (col_h - 8 * 3) // 2,
+                   f"{min(speed, 999):3d}", 3, DASH_WHITE)
+        if lap:
+            line1_y = DASH_SIZE - DASH_FOOTER_H + 3
+            lap_ms, lap_valid = lap
+            ds = lap_ms // 100
+            text = f"{min(99, ds // 600):02d}:{ds // 10 % 60:02d}.{ds % 10}" if lap_valid else "--:--,-"
+            _dash_text(draw, (DASH_SIZE - 7 * 12) // 2, line1_y, text, 2, DASH_WHITE)
+            if delta and delta[1]:
+                delta_ms = delta[0]
+                sign = "-" if delta_ms < 0 else "+"
+                text = f"{sign}{min(99, abs(delta_ms) // 1000):02d}.{abs(delta_ms) % 1000:03d}"
+                _dash_text(draw, (DASH_SIZE - 7 * 12) // 2, line1_y + 16 + 3, text, 2,
+                           DASH_GREEN if delta_ms <= 0 else DASH_RED)
+        return img
+
+    _, has_time, app_connected, now = state
+    top = (DASH_SIZE - (88 if has_time else 42)) // 2
+    if has_time:
+        weekday, hour, minute = now
+        clock = f"{hour:02d}:{minute:02d}"
+        _dash_text(draw, (DASH_SIZE - len(clock) * 18) // 2, top + 2, clock, 3, DASH_WHITE)
+        day = DASH_DAY_NAMES[weekday % 7]
+        _dash_text(draw, (DASH_SIZE - len(day) * 6) // 2, top + 30, day, 1, DASH_WHITE)
+    wheel_x, wheel_y = (DASH_SIZE - len("wheel: --") * 6) // 2, top + (46 if has_time else 0)
+    _dash_text(draw, wheel_x, wheel_y, "wheel: ", 1, DASH_WHITE)
+    _dash_text(draw, wheel_x + 7 * 6, wheel_y, "--", 1, DASH_UNKNOWN)
+    if not app_connected:
+        text = "app: disconnected"
+        _dash_text(draw, (DASH_SIZE - len(text) * 6) // 2, top + (62 if has_time else 16), text, 1, DASH_RED)
+    return img
+
+
 SYNC0, SYNC1 = 0xAA, 0x55
 MSG_STATUS = 0x01
 MSG_SET_CALIBRATION = 0x02
@@ -745,9 +833,11 @@ class VolgasApp:
         main_tab = tk.Frame(content, bg=MAIN_BG)
         pedals_tab = tk.Frame(content, bg=MAIN_BG)
         wheelbase_tab = tk.Frame(content, bg=MAIN_BG)
+        dashboard_tab = tk.Frame(content, bg=MAIN_BG)
         # Settings has no tab button - it's opened by clicking the logo.
         settings_tab = tk.Frame(content, bg=MAIN_BG)
         self._tab_frames = {"Main": main_tab, "Pedals": pedals_tab, "Wheelbase": wheelbase_tab,
+                            "Dashboard": dashboard_tab,
                             "Settings": settings_tab}
         for frame in self._tab_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
@@ -757,6 +847,8 @@ class VolgasApp:
         self._build_main_tab(main_tab)
         self._build_pedals_tab(pedals_tab)
         self._build_wheelbase_tab(wheelbase_tab)
+        self._dash_bridge = DashBridge() if DASH_BRIDGE_AVAILABLE else None
+        self._build_dashboard_tab(dashboard_tab)
         self._build_settings_tab(settings_tab)
         self._caption_hwnd = _hook_caption(self.root)
         self._build_window_chrome([n for n in self._tab_frames if n != "Settings"])
@@ -782,7 +874,7 @@ class VolgasApp:
             # No tab of its own any more: the bridge runs in the background for
             # the app's whole lifetime, finding the dash, picking up rFactor2 or
             # Forza and reconnecting by itself (see volgas_dash_bridge).
-            threading.Thread(target=lambda: DashBridge().run(threading.Event()), daemon=True).start()
+            threading.Thread(target=lambda: self._dash_bridge.run(threading.Event()), daemon=True).start()
         self._remove_old_exe()
         if self._wb_settings.get("check_updates_on_start", True):
             self._start_update_check()
@@ -1779,6 +1871,48 @@ class VolgasApp:
         # not the one under the pointer - so the card takes focus on hover and
         # its rows' wheel / arrow-key nudges work.
         card.bind("<Enter>", lambda _e: card.focus_set(), add="+")
+
+    def _build_dashboard_tab(self, parent):
+        """A live picture of the ESP32 dash's screen (see _render_dash), on a
+        flat card like the other pages."""
+        size = DASH_SIZE * DASH_PREVIEW_SCALE
+        card = self._make_flat_card(parent, size + 2 * CARD_PAD + 40, size + 2 * CARD_PAD + 40)
+        card.pack(padx=20, pady=20)
+        self._dash_image_id = card.create_image(0, 0, anchor="center")
+        frame_id = card.create_rectangle(0, 0, 0, 0, outline=MAIN_BORDER)
+
+        def layout(event):
+            cx, cy = event.width / 2, CARD_PAD + 20 + size / 2
+            card.coords(self._dash_image_id, cx, cy)
+            card.coords(frame_id, cx - size / 2 - 1, cy - size / 2 - 1, cx + size / 2, cy + size / 2)
+
+        card.bind("<Configure>", layout, add="+")
+        self._dash_card = card
+        self._dash_shown_state = None
+        self._dash_preview_poll()
+
+    def _dash_preview_state(self):
+        bridge, now = self._dash_bridge, time.monotonic()
+        if bridge is None or not bridge.connected:
+            return ("standby", False, False, None)
+        tel = bridge.last_telemetry
+        if tel and now - tel[0] < DASH_TELEMETRY_TIMEOUT_S:
+            lap, delta = bridge.last_lap_time, bridge.last_lap_delta
+            footer = lap is not None and now - lap[0] < DASH_FOOTER_TIMEOUT_S
+            return ("classic", tel[1], lap[1] if footer else None,
+                    delta[1] if footer and delta else None)
+        t = time.localtime()
+        return ("standby", bridge.time_synced, True, (t.tm_wday, t.tm_hour, t.tm_min))
+
+    def _dash_preview_poll(self):
+        if self._tab_frames["Dashboard"].winfo_ismapped():
+            state = self._dash_preview_state()
+            if state != self._dash_shown_state:
+                self._dash_shown_state = state
+                size = DASH_SIZE * DASH_PREVIEW_SCALE
+                self._dash_photo = ImageTk.PhotoImage(_render_dash(state).resize((size, size), Image.NEAREST))
+                self._dash_card.itemconfig(self._dash_image_id, image=self._dash_photo)
+        self.root.after(DASH_PREVIEW_MS, self._dash_preview_poll)
 
     def _build_settings_tab(self, parent):
         """Opened by clicking the logo (no tab button). Holds the updater, on a
