@@ -7,15 +7,19 @@ Requires: pip install pyserial
 """
 
 import ctypes
+import hashlib
 import json
 import os
 import queue
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
 
@@ -36,27 +40,77 @@ try:
 except Exception:
     DASH_BRIDGE_AVAILABLE = False
 
-try:
-    # Needs the hidapi package (pip install hidapi - importable as `hid`,
-    # see volgas_ffbeast_api.py's docstring for a naming-collision gotcha).
-    # Guarded the same way as the dash bridge above, so a missing/broken
-    # hidapi install degrades the Wheelbase tab instead of taking down the
-    # whole app.
-    #
-    # Reverted from pid_wheelbase_api (our custom ODrive-based HID PID
-    # firmware) back to volgas_ffbeast_api (FFBeast's vendor HID protocol) - the
-    # board is temporarily back on FFBeast firmware to help isolate whether
-    # a runaway/fault issue is hardware-level or specific to the custom
-    # firmware. pid_wheelbase_api.py is untouched on disk if switching back.
-    import volgas_ffbeast_api
-    WHEELBASE_AVAILABLE = True
-except Exception:
-    WHEELBASE_AVAILABLE = False
-
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.1.0"
+VOLGAS_VERSION = "0.2.0"
+
+# In-app updates come from this repo's GitHub Releases: each release carries
+# Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
+# page (_build_settings_tab).
+UPDATE_API_URL = "https://api.github.com/repos/rhyss08/Volgas/releases/latest"
+UPDATE_EXE_ASSET = "Volgas.exe"
+UPDATE_SHA_ASSET = "Volgas.exe.sha256"
+
+
+def _version_tuple(text):
+    return tuple(int(n) for n in re.findall(r"\d+", text)[:3])
+
+
+def _http_get(url, timeout):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"Volgas/{VOLGAS_VERSION}"}), timeout=timeout)
+
+
+def _fetch_latest_release():
+    """(version, notes, exe_url, sha_url) of the newest GitHub release; a URL
+    is None if that release is missing the asset."""
+    with _http_get(UPDATE_API_URL, 10) as r:
+        data = json.load(r)
+    assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+    return (data["tag_name"].lstrip("v"), data.get("body") or "",
+            assets.get(UPDATE_EXE_ASSET), assets.get(UPDATE_SHA_ASSET))
+
+
+def _download_update(exe_url, sha_url, progress):
+    """Download the new exe next to the running one as Volgas.exe.new and check
+    it against the release's SHA-256 file. Returns its path; on a mismatch the
+    download is deleted and ValueError raised. progress(fraction) is called
+    from this (worker) thread."""
+    new_path = sys.executable + ".new"
+    with _http_get(sha_url, 15) as r:
+        expected = r.read().decode("ascii", "replace").split()[0].lower()
+    digest = hashlib.sha256()
+    with _http_get(exe_url, 30) as r, open(new_path, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            digest.update(chunk)
+            done += len(chunk)
+            if total:
+                progress(done / total)
+    if digest.hexdigest() != expected:
+        os.remove(new_path)
+        raise ValueError("the download doesn't match the release's checksum")
+    return new_path
+
+
+def _install_update(new_path):
+    """Swap the downloaded exe in and start it. Windows won't overwrite a
+    running exe but does let it be renamed (tested on Volgas.exe 2026-10-31):
+    the running Volgas.exe becomes Volgas.exe.old - deleted by the next start,
+    see _remove_old_exe - and the download takes its name."""
+    exe = sys.executable
+    old = exe + ".old"
+    if os.path.exists(old):
+        os.remove(old)
+    os.rename(exe, old)
+    os.rename(new_path, exe)
+    subprocess.Popen([exe], close_fds=True)
 
 
 def _settings_path():
@@ -121,6 +175,12 @@ def show_splash(root):
 PEDAL_VID = 0x1EAF
 PEDAL_PID = 0x0003
 
+# FFBeast support was removed (user, 2026-10-31) ahead of Volgas's own
+# wheelbase firmware, so nothing talks to a wheelbase right now. The Wheelbase
+# tab and the Main tab's wheel controls are kept: they still remember their
+# values (volgas_settings.json) and send commands to wb_cmd_queue, ready for a
+# new backend. The settings below are still FFBeast's field names.
+#
 # Wheelbase-tab slider range per FFBeast setting: (min, max), or ((value,
 # label), ...) for fields that only take a few values. Ranges follow the field
 # comments in FFBeast's wheel_api.h ("0 to 100 in %", "-1 or +1",
@@ -133,7 +193,8 @@ PEDAL_PID = 0x0003
 # CalibrationSpeed, BrakingLimit, EncoderDirection, ForceDirection, PolePairs,
 # DebugTorque, SpeedBufferSize, DirectXConstantDirection, CalibrationMagnitude,
 # PositionSmoothing. IntegratedSpringStrength is an on/off toggle
-# (_add_wb_spring_row), and the soft-stop fields are WB_FIXED_SETTINGS.
+# (_add_wb_spring_row); the soft-stop fields were fixed at strength 100,
+# range 0, dampening 5 and pushed on every connect.
 WB_SLIDER_SPECS = {
     "MotionRange": (90, 1080),
     "StaticDampeningStrength": (0, 100),
@@ -146,26 +207,17 @@ WB_SLIDER_SPECS = {
     "AmplifierGain": ((0, "80x"), (1, "40x"), (2, "20x"), (3, "10x")),
     "PowerLimit": (0, 100),
 }
+# Tab order: these effect rows, the Integrated Spring switch, then the rest.
+WB_EFFECT_KEYS = ("MotionRange", "StaticDampeningStrength", "TotalEffectStrength",
+                  "DirectXSpringStrength", "DirectXConstantStrength", "DirectXPeriodicStrength")
+WB_HARDWARE_KEYS = ("IntegralGain", "ProportionalGain", "AmplifierGain", "PowerLimit")
 INTEGRATED_SPRING_ON_PCT = 30
-
-# Not adjustable in the app (user, 2026-10-23): sent to the board every time
-# it connects, so they always hold.
-# SoftStopDampeningStrength is a percentage field; the user asked for "5".
-WB_FIXED_SETTINGS = {
-    "SoftStopStrength": 100,
-    "SoftStopRange": 0,
-    "SoftStopDampeningStrength": 5,
-}
 
 
 def _wb_display_name(field):
     """'SoftStopDampeningStrength' -> 'Soft Stop Dampening Strength',
     'EncoderCPR' -> 'Encoder CPR', keeping 'DirectX' as one word."""
     return re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", field).replace("Direct X", "DirectX")
-
-# The wheelbase currently talks FFBeast's vendor HID protocol (volgas_ffbeast_api.py)
-# for settings + live position/torque - see the WHEELBASE_AVAILABLE import
-# comment above for why (temporarily back on FFBeast firmware).
 
 MAIN_WHEEL_CANVAS_SIZE = 440
 WHEEL_CARD_ASPECT = 600 / 480  # the Main tab wheel card's requested width / height
@@ -321,6 +373,90 @@ def _apply_dark_titlebar(root, caption_hex, border_hex, text_hex):
     except OSError:
         pass
 
+
+CUSTOM_TITLE_BAR = True  # False puts the native Windows title bar back above the tab strip
+TITLE_BAR_H = 40
+CAPTION_BUTTON_W = 46
+TOP_RESIZE_BAND = 5
+TOP_RESIZE_CORNER = 16
+CAPTION_GLYPHS = {"min": "", "max": "", "restore": "", "close": ""}
+CLOSE_HOVER_BG = "#c42b1c"
+
+GWLP_WNDPROC = -4
+WM_GETMINMAXINFO = 0x0024
+WM_NCCALCSIZE = 0x0083
+WM_NCLBUTTONDOWN = 0x00A1
+WM_SYSCOMMAND = 0x0112
+SC_MINIMIZE, SC_MAXIMIZE, SC_CLOSE, SC_RESTORE = 0xF020, 0xF030, 0xF060, 0xF120
+HTCAPTION, HTTOP, HTTOPLEFT, HTTOPRIGHT = 2, 12, 13, 14
+TOP_EDGE_CURSORS = {HTTOP: "sb_v_double_arrow", HTTOPLEFT: "size_nw_se", HTTOPRIGHT: "size_ne_sw"}
+
+
+def _hook_caption(root):
+    """Remove the native caption but keep the rest of the window frame, so the
+    tab strip can sit at the very top as the title bar. Returns the top-level
+    HWND, or None if the native caption stays.
+
+    Subclasses the real top-level window (GetParent of winfo_id, see
+    _apply_dark_titlebar) and answers WM_NCCALCSIZE with the default frame
+    minus the caption: the side/bottom borders stay native, so resizing,
+    Aero Snap, maximize, the minimize animation and the taskbar all behave as
+    before. Maximized windows hang a frame's width off every screen edge, so
+    the top is inset by that same width there (taken from the left inset).
+    Tk still counts the default top border (caption + frame) in its frame
+    size, so its minimum track height (WM_GETMINMAXINFO) is taken back down
+    by that much.
+    The two earlier attempts - overrideredirect, then stripping WS_CAPTION -
+    each broke Snap/maximize or did nothing; this leaves the window styles
+    exactly as Tk set them."""
+    if sys.platform != "win32" or not CUSTOM_TITLE_BAR:
+        return None
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                           wintypes.WPARAM, wintypes.LPARAM]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.IsZoomed.argtypes = [wintypes.HWND]
+        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        root.update_idletasks()
+        hwnd = user32.GetParent(root.winfo_id())
+        caption_h = [0]
+
+        def proc(h, msg, wparam, lparam):
+            if msg == WM_NCCALCSIZE and wparam:
+                rect = ctypes.cast(lparam, ctypes.POINTER(wintypes.RECT))[0]
+                top, left = rect.top, rect.left
+                result = user32.CallWindowProcW(prev, h, msg, wparam, lparam)
+                inset = rect.left - left
+                if not user32.IsZoomed(h):
+                    caption_h[0] = rect.top - top
+                rect.top = top + (inset if user32.IsZoomed(h) else 0)
+                return result
+            if msg == WM_GETMINMAXINFO:
+                result = user32.CallWindowProcW(prev, h, msg, wparam, lparam)
+                # MINMAXINFO is five POINTs; ptMinTrackSize.y is the 8th LONG.
+                ctypes.cast(lparam, ctypes.POINTER(wintypes.LONG))[7] -= caption_h[0]
+                return result
+            return user32.CallWindowProcW(prev, h, msg, wparam, lparam)
+
+        callback = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM)(proc)
+        prev = user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(callback, ctypes.c_void_p))
+        if not prev:
+            return None
+        root._volgas_caption_hook = callback  # Windows calls it for the window's whole life
+        # SWP_FRAMECHANGED | NOMOVE | NOSIZE | NOZORDER | NOACTIVATE: re-run WM_NCCALCSIZE now.
+        user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004 | 0x0010)
+        return hwnd
+    except (OSError, AttributeError):
+        return None
 
 
 SYNC0, SYNC1 = 0xAA, 0x55
@@ -524,7 +660,7 @@ class VolgasApp:
     def __init__(self, root):
         self.root = root
         # No text in the native caption - the Volgas branding lives in the
-        # app itself now (see _build_logo_strip), not the OS title bar.
+        # app's own title bar (see _build_window_chrome), not the OS caption.
         root.title("")
         try:
             icon_path = asset_path("volgas.ico")
@@ -580,53 +716,48 @@ class VolgasApp:
         self._curve_drag = None  # (pedal_key, point_index) while a curve point is being dragged, else None
 
         self.wb_cmd_queue = queue.Queue()
-        self.wb_status_queue = queue.Queue()
         self.wb_connected = False
 
         # Volgas is the source of truth for the wheelbase settings it shows:
         # every change is remembered in volgas_settings.json ("wheelbase":
-        # {field: value}) and pushed to the board on every connect, so they
-        # hold without Save & Reboot (board RAM settings revert whenever it
-        # reboots or USB drops). A field with nothing remembered yet adopts
-        # the board's own value on first connect - see _wb_poll.
+        # {field: value}), meant to be pushed to the board on every connect
+        # once a wheelbase backend exists again (see WB_SLIDER_SPECS).
         self._wb_settings = _load_settings()
         self._wb_remembered = self._wb_settings.setdefault("wheelbase", {})
 
         # A plain custom tab bar instead of ttk.Notebook, styled to match
-        # the dark theme - see _build_window_chrome. The native title bar
-        # stays (colored dark separately, see _apply_dark_titlebar) rather
-        # than being replaced, after two custom-chrome attempts each broke
-        # something real (Aero Snap/maximize, then a startup crash) - see
-        # _apply_dark_titlebar's docstring for the full story.
-        self.root.rowconfigure(2, weight=1)
+        # the dark theme, that doubles as the title bar - see
+        # _build_window_chrome and _hook_caption.
+        self.root.rowconfigure(1, weight=1)
         self.root.columnconfigure(0, weight=1)
         content = tk.Frame(self.root, bg=MAIN_BG)
-        content.grid(row=2, column=0, sticky="nsew")
+        content.grid(row=1, column=0, sticky="nsew")
         content.grid_rowconfigure(0, weight=1)
         content.grid_columnconfigure(0, weight=1)
 
         main_tab = tk.Frame(content, bg=MAIN_BG)
         pedals_tab = tk.Frame(content, bg=MAIN_BG)
         wheelbase_tab = tk.Frame(content, bg=MAIN_BG)
-        firmware_tab = tk.Frame(content, bg=MAIN_BG)
+        # Settings has no tab button - it's opened by clicking the logo.
+        settings_tab = tk.Frame(content, bg=MAIN_BG)
         self._tab_frames = {"Main": main_tab, "Pedals": pedals_tab, "Wheelbase": wheelbase_tab,
-                            "Firmware": firmware_tab}
+                            "Settings": settings_tab}
         for frame in self._tab_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
 
+        self._update_queue = queue.Queue()
+        self._update_busy = False
         self._build_main_tab(main_tab)
         self._build_pedals_tab(pedals_tab)
         self._build_wheelbase_tab(wheelbase_tab)
-        self._build_firmware_tab(firmware_tab)
-        self._build_window_chrome(list(self._tab_frames.keys()))
-        self._build_logo_strip()
+        self._build_settings_tab(settings_tab)
+        self._caption_hwnd = _hook_caption(self.root)
+        self._build_window_chrome([n for n in self._tab_frames if n != "Settings"])
 
         # Floor the window at the size its content actually asks for (driven
         # by the Main tab's card/gauge minimum sizes, see _build_main_tab).
-        # The native window frame (title bar, resize border) is kept - see
-        # _apply_dark_titlebar's docstring for why - so this is enforced
-        # normally by Windows during an interactive resize, same as any
-        # other resizable app.
+        # The native resize border is kept (see _hook_caption), so Windows
+        # enforces this during an interactive resize like any other app.
         self.root.update_idletasks()
         req_w, req_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         self.root.minsize(req_w, req_h)
@@ -645,31 +776,166 @@ class VolgasApp:
             # the app's whole lifetime, finding the dash, picking up rFactor2 or
             # Forza and reconnecting by itself (see volgas_dash_bridge).
             threading.Thread(target=lambda: DashBridge().run(threading.Event()), daemon=True).start()
-        if WHEELBASE_AVAILABLE:
-            self.wb_thread = threading.Thread(target=self._wb_worker_loop, daemon=True)
-            self.wb_thread.start()
-            self._wb_poll()
+        self._remove_old_exe()
+        if self._wb_settings.get("check_updates_on_start", True):
+            self._start_update_check()
 
-    # ---------- window chrome (dark tab strip, native title bar) ----------
+    # ---------- window chrome (dark tab strip as the title bar) ----------
 
     def _build_window_chrome(self, tab_names):
         """The tab strip, styled to match the dark theme and replacing
-        ttk.Notebook's own tab widget - the native title bar (colored dark
-        separately, see _apply_dark_titlebar) stays in place above this for
-        its min/max/close/drag/resize/Snap, all of which come for free and
-        don't need reimplementing here."""
-        bar = tk.Frame(self.root, bg=MAIN_PANEL, height=40)
+        ttk.Notebook's own tab widget. With the native caption removed (see
+        _hook_caption) it is also the title bar: its empty space drags the
+        window (handing off to Windows' own move loop, so Snap and
+        drag-to-restore work), double-click maximizes, its top few pixels
+        resize, and it carries the min/max/close buttons. If the hook isn't
+        in place the native title bar stays above it instead."""
+        bar = tk.Frame(self.root, bg=MAIN_PANEL, height=TITLE_BAR_H)
         bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_propagate(False)
+        bar.pack_propagate(False)
         self.root.columnconfigure(0, weight=1)
+
+        # The Volgas mark leads the bar; clicking it opens the Settings page.
+        logo_size = 24
+        logo_im = Image.open(asset_path("volgas_logo.png")).convert("RGBA").resize((logo_size, logo_size), Image.LANCZOS)
+        self._logo_photo = ImageTk.PhotoImage(logo_im)
+        logo = tk.Label(bar, image=self._logo_photo, bg=MAIN_PANEL, cursor="hand2")
+        logo.pack(side="left", padx=(14, 8))
+        logo.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
 
         self._tab_buttons = {}
         for name in tab_names:
             btn = tk.Label(bar, text=name.upper(), font=("Segoe UI", 9, "bold"),
                             fg=MAIN_TEXT_DIM, bg=MAIN_PANEL, padx=14, cursor="hand2")
-            btn.pack(side="left", fill="y", padx=(12 if name == tab_names[0] else 0, 0))
+            btn.pack(side="left", fill="y")
             btn.bind("<Button-1>", lambda _e, n=name: self._select_tab(n))
             self._tab_buttons[name] = btn
+
+        # Shown after the tabs when an update check finds a newer release.
+        self._update_badge = tk.Label(bar, text="Update available", font=("Segoe UI", 9, "bold"),
+                                      fg=MAIN_CYAN, bg=MAIN_PANEL, cursor="hand2")
+        self._update_badge.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
+
+        if not self._caption_hwnd:
+            return
+        self._build_caption_buttons(bar)
+        self._bar_press = None
+        bar.bind("<ButtonPress-1>", self._on_bar_press)
+        bar.bind("<B1-Motion>", self._on_bar_drag)
+        bar.bind("<Double-Button-1>", self._on_bar_double)
+        bar.bind("<ButtonRelease-1>", self._on_bar_release)
+        self._bar_double = False
+        # Every widget in the bar gets the top-edge resize band, ahead of its
+        # own bindings so a press there resizes instead of clicking a tab.
+        self._title_cursors = {}
+        for w in (bar, *bar.winfo_children()):
+            self._title_cursors[w] = w.cget("cursor")
+            w.bindtags(("VolgasTitleBar",) + w.bindtags())
+        self.root.bind_class("VolgasTitleBar", "<Motion>", self._on_title_motion)
+        self.root.bind_class("VolgasTitleBar", "<ButtonPress-1>", self._on_title_press)
+        self.root.bind("<Configure>", self._sync_max_glyph, add="+")
+
+    def _build_caption_buttons(self, bar):
+        families = set(tkfont.families(self.root))
+        glyph_font = ("Segoe Fluent Icons" if "Segoe Fluent Icons" in families else "Segoe MDL2 Assets", 8)
+        user32 = ctypes.windll.user32
+        buttons = (("close", lambda: user32.PostMessageW(self._caption_hwnd, WM_SYSCOMMAND, SC_CLOSE, 0),
+                    CLOSE_HOVER_BG),
+                   ("max", self._toggle_maximize, MAIN_BORDER),
+                   ("min", lambda: user32.PostMessageW(self._caption_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0),
+                    MAIN_BORDER))
+        for key, action, hover_bg in buttons:
+            btn = tk.Canvas(bar, width=CAPTION_BUTTON_W, height=TITLE_BAR_H, bg=MAIN_PANEL, highlightthickness=0)
+            btn.create_text(CAPTION_BUTTON_W // 2, TITLE_BAR_H // 2, text=CAPTION_GLYPHS[key],
+                            font=glyph_font, fill=MAIN_TEXT, tags="glyph")
+            btn.pack(side="right", fill="y")
+            btn.bind("<Enter>", lambda _e, b=btn, bg=hover_bg: b.config(bg=bg))
+            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=MAIN_PANEL))
+            # Acts on release over the button, like the native ones.
+            btn.bind("<ButtonRelease-1>",
+                     lambda e, a=action: a() if 0 <= e.x < e.widget.winfo_width()
+                     and 0 <= e.y < e.widget.winfo_height() else None)
+            if key == "max":
+                self._max_button = btn
+        self._max_glyph_zoomed = False
+
+    def _is_zoomed(self):
+        return bool(ctypes.windll.user32.IsZoomed(self._caption_hwnd))
+
+    def _toggle_maximize(self):
+        ctypes.windll.user32.PostMessageW(self._caption_hwnd, WM_SYSCOMMAND,
+                                          SC_RESTORE if self._is_zoomed() else SC_MAXIMIZE, 0)
+
+    def _sync_max_glyph(self, event):
+        if event.widget is not self.root:
+            return
+        zoomed = self._is_zoomed()
+        if zoomed != self._max_glyph_zoomed:
+            self._max_glyph_zoomed = zoomed
+            self._max_button.itemconfig("glyph", text=CAPTION_GLYPHS["restore" if zoomed else "max"])
+
+    def _on_bar_press(self, event):
+        """Empty bar space only arms a drag; Windows' move loop starts once
+        the mouse moves past the drag threshold (_on_bar_drag). Starting it
+        on the press made the loop swallow a plain click, so a double-click
+        never reached Tk."""
+        self._bar_press = event
+
+    def _on_bar_drag(self, event):
+        press = self._bar_press
+        user32 = ctypes.windll.user32
+        if press and (abs(event.x_root - press.x_root) >= user32.GetSystemMetrics(68)  # SM_CXDRAG
+                      or abs(event.y_root - press.y_root) >= user32.GetSystemMetrics(69)):  # SM_CYDRAG
+            self._bar_press = None
+            # The press point, so the window keeps the grab offset it had.
+            self._start_native_drag(HTCAPTION, press)
+
+    def _on_bar_double(self, _event):
+        self._bar_press = None
+        self._bar_double = True
+
+    def _on_bar_release(self, _event):
+        # Maximize on the second release, not the second press: an SC_MAXIMIZE
+        # handled while the button is still down (Tk holding the mouse) was
+        # received but ignored (seen in a debug log).
+        self._bar_press = None
+        if self._bar_double:
+            self._bar_double = False
+            self._toggle_maximize()
+
+    def _start_native_drag(self, hit, event):
+        """Hand the press to Windows as if it landed on the native caption
+        (or top border): its own modal move/size loop takes over. Posted,
+        not sent: a SendMessage would run the loop inside this Python
+        callback, and Tk's timers firing Python callbacks inside that loop
+        kill the interpreter (fatal "PyEval_RestoreThread ... GIL is
+        released"). Posted messages are retrieved before input, so the loop
+        still starts while the button is down."""
+        user32 = ctypes.windll.user32
+        user32.ReleaseCapture()  # Tk captures the mouse on press
+        user32.PostMessageW(self._caption_hwnd, WM_NCLBUTTONDOWN, hit,
+                            ((event.y_root & 0xFFFF) << 16) | (event.x_root & 0xFFFF))
+
+    def _top_edge_hit(self, event):
+        if event.y_root - self.root.winfo_rooty() >= TOP_RESIZE_BAND or self._is_zoomed():
+            return None
+        x = event.x_root - self.root.winfo_rootx()
+        if x < TOP_RESIZE_CORNER:
+            return HTTOPLEFT
+        if x >= self.root.winfo_width() - TOP_RESIZE_CORNER:
+            return HTTOPRIGHT
+        return HTTOP
+
+    def _on_title_motion(self, event):
+        cursor = TOP_EDGE_CURSORS.get(self._top_edge_hit(event), self._title_cursors[event.widget])
+        if event.widget.cget("cursor") != cursor:
+            event.widget.config(cursor=cursor)
+
+    def _on_title_press(self, event):
+        hit = self._top_edge_hit(event)
+        if hit:
+            self._start_native_drag(hit, event)
+            return "break"
 
     def _select_tab(self, name):
         for n, btn in self._tab_buttons.items():
@@ -695,18 +961,11 @@ class VolgasApp:
             # disconnected doesn't pop up a warning dialog.
             self.wb_cmd_queue.put(("read_settings",))
 
-    def _build_logo_strip(self):
-        """The Volgas mark, moved out of the native title bar (now blank,
-        see root.title("") above) and out of the Main tab's own header -
-        sits in its own thin row directly under the Main/Pedals/Dash
-        Telemetry/Wheelbase tab strip instead."""
-        strip = tk.Frame(self.root, bg=MAIN_BG, height=56)
-        strip.grid(row=1, column=0, sticky="ew")
-        strip.grid_propagate(False)
-        logo_size = 32
-        logo_im = Image.open(asset_path("volgas_logo.png")).convert("RGBA").resize((logo_size, logo_size), Image.LANCZOS)
-        self._logo_photo = ImageTk.PhotoImage(logo_im)
-        tk.Label(strip, image=self._logo_photo, bg=MAIN_BG).pack(pady=(12, 0))
+    def _show_update_badge(self, show):
+        if show:
+            self._update_badge.pack(side="left", fill="y", padx=(12, 0))
+        else:
+            self._update_badge.pack_forget()
 
     # ---------- UI ----------
 
@@ -1449,17 +1708,12 @@ class VolgasApp:
         refresh_reading()
 
     def _build_wheelbase_tab(self, parent):
-        if not WHEELBASE_AVAILABLE:
-            ttk.Label(parent, text="unavailable - install the hidapi package (pip install hidapi)",
-                      foreground="red").grid(row=0, column=0, sticky="w", padx=8, pady=8)
-            return
-
         # Same look as the Main tab: flat buttons on the dark background, then
         # a rounded flat card with one full-width glow-bar row per setting,
         # all stacked in a single column.
         top = tk.Frame(parent, bg=MAIN_BG)
         top.pack(fill="x", padx=20, pady=(12, 8))
-        self.wb_status_label = tk.Label(top, text="searching for wheelbase...", font=("Segoe UI", 9),
+        self.wb_status_label = tk.Label(top, text="no wheelbase support yet", font=("Segoe UI", 9),
                                         fg="gray", bg=MAIN_BG)
         self.wb_status_label.pack(side="left")
         # Only Save & Reboot: every change applies as it happens and Volgas
@@ -1475,8 +1729,7 @@ class VolgasApp:
         # this tab - written by the read_effect_settings()/
         # read_hardware_settings() sync (_on_wb_settings) and by the rows.
         self.wb_field_vars = {}
-        effect_keys = [k for k in volgas_ffbeast_api.EFFECT_SETTINGS_KEYS if k in WB_SLIDER_SPECS]
-        hardware_keys = [k for k in volgas_ffbeast_api.HARDWARE_SETTINGS_KEYS if k in WB_SLIDER_SPECS]
+        effect_keys, hardware_keys = list(WB_EFFECT_KEYS), list(WB_HARDWARE_KEYS)
         # One name column wide enough for the longest name, so every bar
         # starts at the same x.
         names = [_wb_display_name(k).upper() for k in effect_keys + hardware_keys] + ["INTEGRATED SPRING"]
@@ -1520,12 +1773,174 @@ class VolgasApp:
         # its rows' wheel / arrow-key nudges work.
         card.bind("<Enter>", lambda _e: card.focus_set(), add="+")
 
-    def _build_firmware_tab(self, parent):
-        # Placeholder - firmware updates (wheelbase/pedals/dash) get built here later.
-        ttk.Label(parent, text=f"Volgas v{VOLGAS_VERSION}", foreground=MAIN_TEXT).grid(
-            row=0, column=0, sticky="w", padx=16, pady=(16, 4))
-        ttk.Label(parent, text="Firmware updates will live here.", foreground=MAIN_TEXT_DIM).grid(
-            row=1, column=0, sticky="w", padx=16, pady=(0, 16))
+    def _build_settings_tab(self, parent):
+        """Opened by clicking the logo (no tab button). Holds the updater, on a
+        flat card like the other pages: version, a check-on-startup switch,
+        status, Check / Update buttons and the newer release's notes."""
+        names = ["VERSION", "CHECK ON STARTUP", "STATUS", "WHAT'S NEW"]
+        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + 24
+        rows = 8  # version, switch, status, buttons, then four for release notes
+        card = self._make_flat_card(parent, 520, WB_ROWS_TOP + rows * WB_ROW_H + CARD_PAD)
+        card.pack(fill="x", padx=20, pady=20)
+        x0 = CARD_PAD + name_w  # where values start, like the Wheelbase bars
+
+        version_id, _ = self._add_wb_row_label(card, WB_ROWS_TOP, "VERSION")
+        card.itemconfig(version_id, text=f"v{VOLGAS_VERSION}")
+
+        switch_value_id, switch_mid = self._add_wb_row_label(card, WB_ROWS_TOP + WB_ROW_H, "CHECK ON STARTUP")
+        on = {"value": self._wb_settings.get("check_updates_on_start", True)}
+
+        def redraw_switch():
+            _draw_toggle(card, on["value"], x0, switch_mid - 10, tag="update_switch")
+            card.itemconfig(switch_value_id, text="On" if on["value"] else "Off")
+
+        def press(event):
+            if x0 - 4 <= event.x <= x0 + 44 and switch_mid - 14 <= event.y <= switch_mid + 14:
+                on["value"] = not on["value"]
+                self._wb_settings["check_updates_on_start"] = on["value"]
+                _save_settings(self._wb_settings)
+                redraw_switch()
+
+        card.bind("<Button-1>", press, add="+")
+        redraw_switch()
+
+        status_mid = WB_ROWS_TOP + 2 * WB_ROW_H + WB_ROW_H / 2
+        card.create_text(CARD_PAD + 4, status_mid, text="STATUS", font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
+        self._update_status_id = card.create_text(x0, status_mid, text="Not checked yet", font=("Segoe UI", 10),
+                                                  fill=MAIN_TEXT, anchor="w")
+
+        button_style = dict(font=("Segoe UI", 9), fg=MAIN_TEXT, bg=MAIN_BORDER, activebackground=MAIN_CYAN,
+                            activeforeground=MAIN_BG, relief="flat", padx=12, pady=4, bd=0, cursor="hand2")
+        buttons = tk.Frame(card, bg=MAIN_PANEL)
+        tk.Button(buttons, text="Check for updates", command=self._start_update_check, **button_style).pack(side="left")
+        self._update_install_btn = tk.Button(buttons, text="Update", command=self._start_update_install,
+                                             **button_style)
+        card.create_window(x0, WB_ROWS_TOP + 3 * WB_ROW_H + WB_ROW_H / 2, window=buttons, anchor="w")
+
+        notes_top = WB_ROWS_TOP + 4 * WB_ROW_H
+        self._update_notes_title_id = card.create_text(CARD_PAD + 4, notes_top + WB_ROW_H / 2, text="",
+                                                       font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
+        self._update_notes_id = card.create_text(x0, notes_top + 8, text="", font=("Segoe UI", 9),
+                                                 fill=MAIN_TEXT_DIM, anchor="nw")
+        card.bind("<Configure>", lambda e: card.itemconfig(
+            self._update_notes_id, width=max(50, e.width - x0 - CARD_PAD - 8)), add="+")
+        self._settings_card = card
+
+    def _set_update_status(self, text, color=MAIN_TEXT):
+        self._settings_card.itemconfig(self._update_status_id, text=text, fill=color)
+
+    def _start_update_check(self):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._update_phase = "check"
+        self._set_update_status("Checking for updates...")
+
+        def work():
+            try:
+                self._update_queue.put(("checked", _fetch_latest_release()))
+            except Exception as e:
+                self._update_queue.put(("error", e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._update_poll()
+
+    def _start_update_install(self):
+        if self._update_busy:
+            return
+        version, _notes, exe_url, sha_url = self._latest_release
+        if not getattr(sys, "frozen", False):
+            self._set_update_status("Updating only works in Volgas.exe, not when running volgas.py", MAIN_ORANGE_STATUS)
+            return
+        if not messagebox.askyesno("Update Volgas", f"Download and install Volgas v{version}? "
+                                                     "Volgas will close and restart itself."):
+            return
+        self._update_busy = True
+        self._update_phase = "download"
+        self._set_update_status("Downloading v{}... 0%".format(version))
+
+        def work():
+            try:
+                path = _download_update(exe_url, sha_url,
+                                        lambda frac: self._update_queue.put(("progress", frac)))
+                self._update_queue.put(("downloaded", path))
+            except Exception as e:
+                self._update_queue.put(("error", e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self._update_poll()
+
+    def _update_poll(self):
+        """Handle the update worker's messages on the UI thread; keeps polling
+        only while a check or download is running."""
+        try:
+            while True:
+                kind, value = self._update_queue.get_nowait()
+                if kind == "checked":
+                    self._update_busy = False
+                    self._on_update_checked(value)
+                elif kind == "progress":
+                    self._set_update_status(f"Downloading v{self._latest_release[0]}... {round(value * 100)}%")
+                elif kind == "downloaded":
+                    self._set_update_status("Installing...")
+                    try:
+                        _install_update(value)
+                    except OSError as e:
+                        self._update_busy = False
+                        self._set_update_status(f"Couldn't install the update: {e}", MAIN_RED)
+                        return
+                    self.root.destroy()
+                    return
+                elif kind == "error":
+                    self._update_busy = False
+                    if self._update_phase == "download":
+                        try:  # a failed download can leave a partial file
+                            os.remove(sys.executable + ".new")
+                        except OSError:
+                            pass
+                        text = f"Update failed: {value}"
+                    elif isinstance(value, urllib.error.HTTPError) and value.code == 404:
+                        text = "Couldn't check for updates: no public release found"
+                    else:
+                        text = f"Couldn't check for updates: {value}"
+                    self._set_update_status(text, MAIN_RED)
+        except queue.Empty:
+            pass
+        if self._update_busy:
+            self.root.after(100, self._update_poll)
+
+    def _on_update_checked(self, release):
+        self._latest_release = release
+        version, notes, exe_url, sha_url = release
+        newer = _version_tuple(version) > _version_tuple(VOLGAS_VERSION)
+        card = self._settings_card
+        if newer and exe_url and sha_url:
+            self._set_update_status(f"Volgas v{version} is available", MAIN_CYAN)
+            self._update_install_btn.config(text=f"Update to v{version}")
+            self._update_install_btn.pack(side="left", padx=(8, 0))
+            card.itemconfig(self._update_notes_title_id, text="WHAT'S NEW")
+            card.itemconfig(self._update_notes_id, text=notes.strip()[:600])
+        else:
+            text = (f"v{version} is out, but its download files are missing" if newer
+                    else f"Volgas is up to date (v{VOLGAS_VERSION})")
+            self._set_update_status(text, MAIN_ORANGE_STATUS if newer else MAIN_GREEN)
+            self._update_install_btn.pack_forget()
+            card.itemconfig(self._update_notes_title_id, text="")
+            card.itemconfig(self._update_notes_id, text="")
+        self._show_update_badge(newer and bool(exe_url and sha_url))
+
+    def _remove_old_exe(self, tries=10):
+        """Delete the Volgas.exe.old a previous in-app update left behind
+        (_install_update). It can still be in use for a moment while the old
+        process closes, so retry a few times."""
+        old = sys.executable + ".old"
+        if not getattr(sys, "frozen", False) or not os.path.exists(old):
+            return
+        try:
+            os.remove(old)
+        except OSError:
+            if tries > 1:
+                self.root.after(2000, lambda: self._remove_old_exe(tries - 1))
 
     def _add_wb_row_label(self, card, row_top, text):
         """Name on the left and value text on the right of one Wheelbase card
@@ -1769,124 +2184,6 @@ class VolgasApp:
             messagebox.showwarning("Not connected", "Wheelbase not connected.")
             return
         self.wb_cmd_queue.put(cmd)
-
-    def _wb_worker_loop(self):
-        # Single worker thread owns the hid.device handle for its whole
-        # lifetime - hidapi handles aren't meant to be shared across threads,
-        # so both outgoing commands (from the UI, via wb_cmd_queue) and the
-        # live state poll happen here rather than from the UI thread.
-        wb = volgas_ffbeast_api.FFBeastWheel()
-        connected = False
-        while True:
-            if not connected:
-                try:
-                    connected = wb.connect()
-                except Exception:
-                    connected = False
-                if connected:
-                    self.wb_status_queue.put(("connected",))
-                    # Push the WB_FIXED_SETTINGS and everything Volgas remembers
-                    # (see __init__'s _wb_remembered comment) first, then read
-                    # the board back - so the UI shows what's really applied,
-                    # and fields with nothing remembered yet show (and get
-                    # adopted from) the board's own values.
-                    try:
-                        remembered = dict(self._wb_remembered)  # snapshot - the UI thread writes it
-                        for name, value in {**WB_FIXED_SETTINGS, **remembered}.items():
-                            if name in volgas_ffbeast_api.SETTINGS_FIELDS:
-                                wb.send_setting(name, value)
-                        effect = wb.read_effect_settings()
-                        hardware = wb.read_hardware_settings()
-                        self.wb_status_queue.put(("settings", {**effect, **hardware}))
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(1)
-                    continue
-
-            try:
-                while True:
-                    cmd = self.wb_cmd_queue.get_nowait()
-                    self._wb_run_command(wb, cmd)
-            except queue.Empty:
-                pass
-            except Exception as e:
-                connected = False
-                wb.close()
-                self.wb_status_queue.put(("disconnected", str(e)))
-                continue
-
-            try:
-                state = wb.read_state(timeout_ms=50)
-                if state:
-                    self.wb_status_queue.put(("state", state))
-            except Exception as e:
-                connected = False
-                wb.close()
-                self.wb_status_queue.put(("disconnected", str(e)))
-
-    def _wb_run_command(self, wb, cmd):
-        kind = cmd[0]
-        if kind == "send_setting":
-            _, name, value = cmd
-            wb.send_setting(name, value)
-        elif kind == "save_and_reboot":
-            wb.save_and_reboot()
-        elif kind == "reset_center":
-            wb.reset_center()
-        elif kind == "read_settings":
-            # On-demand re-read (see _select_tab) - the Wheelbase tab's own
-            # fields only otherwise got populated once, right after connect,
-            # so they'd go stale as soon as anything changed them elsewhere
-            # (e.g. the Main tab's sliders) without a reconnect happening.
-            effect = wb.read_effect_settings()
-            hardware = wb.read_hardware_settings()
-            self.wb_status_queue.put(("settings", {**effect, **hardware}))
-
-    def _wb_poll(self):
-        # "state" messages can arrive far faster than this poll runs (the
-        # board streams them continuously) - coalesce to only the latest one
-        # and do the (relatively expensive) wheel-image rotation at most once
-        # per poll, instead of once per queued message. Without this, a fast
-        # stream backs the queue up faster than it can be drained and the UI
-        # thread falls further and further behind doing redundant rotates
-        # until the app stops responding entirely.
-        latest_state = None
-        try:
-            while True:
-                msg = self.wb_status_queue.get_nowait()
-                kind = msg[0]
-                if kind == "state":
-                    latest_state = msg[1]
-                    continue
-                if kind == "connected":
-                    self.wb_connected = True
-                    self.wb_status_label.config(text="connected", foreground="green")
-                    self.main_wb_status_label.config(text="wheelbase: connected", foreground="green")
-                elif kind == "disconnected":
-                    self.wb_connected = False
-                    self.wb_status_label.config(text="searching for wheelbase...", foreground="gray")
-                    self.main_wb_status_label.config(text="wheelbase: searching...", foreground="gray")
-                elif kind == "error":
-                    self.wb_status_label.config(text=f"error: {msg[1]}", foreground="red")
-                elif kind == "settings":
-                    self._on_wb_settings(msg[1])
-                    missing = {n: v for n, v in msg[1].items()
-                               if (n in self.wb_field_vars or n == "ForceEnabled") and n not in self._wb_remembered}
-                    if missing:
-                        self._wb_remembered.update(missing)
-                        _save_settings(self._wb_settings)
-        except queue.Empty:
-            pass
-        if latest_state is not None:
-            position = latest_state.get("Position")
-            if position is not None:
-                self._update_main_wheel(position)
-        # ~60fps - still safe against the backlog bug above: each cycle only
-        # ever does one rotate no matter how many "state" messages piled up,
-        # so polling faster just means less staleness per redraw, not more
-        # work per redraw.
-        self.root.after(16, self._wb_poll)
 
     def _on_wb_settings(self, settings):
         """Populate the Wheelbase tab's sliders and sync the Main tab's
