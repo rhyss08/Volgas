@@ -33,7 +33,7 @@ Click **More info → Run anyway**.
 Windows, Python 3.12:
 
 ```
-pip install pyserial pillow pyinstaller
+pip install pyserial pillow certifi pyinstaller
 cd pc_app
 python -m PyInstaller --onefile --windowed --name Volgas --icon assets/volgas.ico --add-data "assets/volgas_logo.png;assets" --add-data "assets/volgas.ico;assets" --add-data "assets/volgas_wheel.png;assets" volgas.py
 ```

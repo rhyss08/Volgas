@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import ssl
 import struct
 import subprocess
 import sys
@@ -23,6 +24,7 @@ import urllib.request
 from tkinter import ttk, messagebox
 from tkinter import font as tkfont
 
+import certifi
 import serial
 import serial.tools.list_ports
 from collections import deque
@@ -58,8 +60,13 @@ def _version_tuple(text):
 
 
 def _http_get(url, timeout):
+    # certifi's CA bundle, not the Windows store: Windows only downloads most
+    # roots the first time its own networking needs them, so Python found
+    # GitHub's Sectigo root missing ("unable to get issuer certificate").
+    context = ssl.create_default_context(cafile=certifi.where())
     return urllib.request.urlopen(urllib.request.Request(url, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": f"Volgas/{VOLGAS_VERSION}"}), timeout=timeout)
+        "Accept": "application/vnd.github+json", "User-Agent": f"Volgas/{VOLGAS_VERSION}"}),
+        timeout=timeout, context=context)
 
 
 def _fetch_latest_release():
