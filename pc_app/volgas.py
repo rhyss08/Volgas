@@ -45,7 +45,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.2.0"
+VOLGAS_VERSION = "0.2.1"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -1788,7 +1788,7 @@ class VolgasApp:
         name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + 24
         rows = 8  # version, switch, status, buttons, then four for release notes
         card = self._make_flat_card(parent, 520, WB_ROWS_TOP + rows * WB_ROW_H + CARD_PAD)
-        card.pack(fill="x", padx=20, pady=20)
+        card.pack(padx=20, pady=20)  # its own 520 px, not stretched to the window
         x0 = CARD_PAD + name_w  # where values start, like the Wheelbase bars
 
         version_id, _ = self._add_wb_row_label(card, WB_ROWS_TOP, "VERSION")
@@ -1833,8 +1833,8 @@ class VolgasApp:
             self._update_notes_id, width=max(50, e.width - x0 - CARD_PAD - 8)), add="+")
         self._settings_card = card
 
-    def _set_update_status(self, text, color=MAIN_TEXT):
-        self._settings_card.itemconfig(self._update_status_id, text=text, fill=color)
+    def _set_update_status(self, text):
+        self._settings_card.itemconfig(self._update_status_id, text=text)
 
     def _start_update_check(self):
         if self._update_busy:
@@ -1857,7 +1857,7 @@ class VolgasApp:
             return
         version, _notes, exe_url, sha_url = self._latest_release
         if not getattr(sys, "frozen", False):
-            self._set_update_status("Updating only works in Volgas.exe, not when running volgas.py", MAIN_ORANGE_STATUS)
+            self._set_update_status("Updating only works in Volgas.exe, not when running volgas.py")
             return
         if not messagebox.askyesno("Update Volgas", f"Download and install Volgas v{version}? "
                                                      "Volgas will close and restart itself."):
@@ -1894,7 +1894,7 @@ class VolgasApp:
                         _install_update(value)
                     except OSError as e:
                         self._update_busy = False
-                        self._set_update_status(f"Couldn't install the update: {e}", MAIN_RED)
+                        self._set_update_status(f"Couldn't install the update: {e}")
                         return
                     self.root.destroy()
                     return
@@ -1910,7 +1910,7 @@ class VolgasApp:
                         text = "Couldn't check for updates: no public release found"
                     else:
                         text = f"Couldn't check for updates: {value}"
-                    self._set_update_status(text, MAIN_RED)
+                    self._set_update_status(text)
         except queue.Empty:
             pass
         if self._update_busy:
@@ -1922,7 +1922,7 @@ class VolgasApp:
         newer = _version_tuple(version) > _version_tuple(VOLGAS_VERSION)
         card = self._settings_card
         if newer and exe_url and sha_url:
-            self._set_update_status(f"Volgas v{version} is available", MAIN_CYAN)
+            self._set_update_status(f"Volgas v{version} is available")
             self._update_install_btn.config(text=f"Update to v{version}")
             self._update_install_btn.pack(side="left", padx=(8, 0))
             card.itemconfig(self._update_notes_title_id, text="WHAT'S NEW")
@@ -1930,7 +1930,7 @@ class VolgasApp:
         else:
             text = (f"v{version} is out, but its download files are missing" if newer
                     else f"Volgas is up to date (v{VOLGAS_VERSION})")
-            self._set_update_status(text, MAIN_ORANGE_STATUS if newer else MAIN_GREEN)
+            self._set_update_status(text)
             self._update_install_btn.pack_forget()
             card.itemconfig(self._update_notes_title_id, text="")
             card.itemconfig(self._update_notes_id, text="")
