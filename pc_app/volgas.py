@@ -47,7 +47,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.2.2"
+VOLGAS_VERSION = "0.2.3"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -1966,6 +1966,17 @@ class VolgasApp:
         card.bind("<Configure>", lambda e: card.itemconfig(
             self._update_notes_id, width=max(50, e.width - x0 - CARD_PAD - 8)), add="+")
         self._settings_card = card
+        self._fit_settings_card()
+
+    def _fit_settings_card(self):
+        """Height = what's showing plus the same gap below the last line as
+        above the first, so the card shrinks when there are no release notes."""
+        card = self._settings_card
+        card.update_idletasks()
+        shown = [i for i in card.find_all()[1:]  # [0] is _make_flat_card's background
+                 if card.type(i) != "text" or card.itemcget(i, "text")]
+        top, bottom = card.bbox(*shown)[1::2]
+        card.config(height=bottom + top)
 
     def _set_update_status(self, text):
         self._settings_card.itemconfig(self._update_status_id, text=text)
@@ -2068,6 +2079,7 @@ class VolgasApp:
             self._update_install_btn.pack_forget()
             card.itemconfig(self._update_notes_title_id, text="")
             card.itemconfig(self._update_notes_id, text="")
+        self._fit_settings_card()
         self._show_update_badge(newer and bool(exe_url and sha_url))
 
     def _remove_old_exe(self, tries=10):
