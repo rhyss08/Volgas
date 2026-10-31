@@ -54,6 +54,11 @@ except Exception:
     WHEELBASE_AVAILABLE = False
 
 
+# Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
+# this against the latest release's tag.
+VOLGAS_VERSION = "0.1.0"
+
+
 def _settings_path():
     # Next to Volgas.exe on disk, not inside the onefile bundle's temp extraction dir.
     base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
@@ -1517,8 +1522,10 @@ class VolgasApp:
 
     def _build_firmware_tab(self, parent):
         # Placeholder - firmware updates (wheelbase/pedals/dash) get built here later.
+        ttk.Label(parent, text=f"Volgas v{VOLGAS_VERSION}", foreground=MAIN_TEXT).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(16, 4))
         ttk.Label(parent, text="Firmware updates will live here.", foreground=MAIN_TEXT_DIM).grid(
-            row=0, column=0, sticky="w", padx=16, pady=16)
+            row=1, column=0, sticky="w", padx=16, pady=(0, 16))
 
     def _add_wb_row_label(self, card, row_top, text):
         """Name on the left and value text on the right of one Wheelbase card
