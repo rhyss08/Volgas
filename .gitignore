@@ -23,3 +23,6 @@ pc_app/debug_*.txt
 # Editor / OS / tool files
 .DS_Store
 .claude/
+
+# Private project notes - kept on this PC only, never uploaded
+CLAUDE.md
