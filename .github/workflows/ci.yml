@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        working-directory: pc_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q tests
+
+  build-windows:
+    name: Build Volgas.exe
+    needs: test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: pc_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m PyInstaller --noconfirm Volgas.spec
+      - name: Checksum
+        shell: pwsh
+        run: (Get-FileHash dist/Volgas.exe -Algorithm SHA256).Hash.ToLower() + "  Volgas.exe" | Out-File -Encoding ascii dist/Volgas.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Volgas-windows
+          path: |
+            pc_app/dist/Volgas.exe
+            pc_app/dist/Volgas.exe.sha256
