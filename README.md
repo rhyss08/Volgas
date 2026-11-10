@@ -14,12 +14,16 @@ box steering wheel and a small dash display.
 
 ### The app
 
-- **Main**: live throttle and brake bars, plus the wheel card.
-- **Pedals**: live readings, a calibration wizard and response curves. The pedals are found automatically over USB.
-- **Dashboard**: a live picture of what the dash screen is showing.
-- **Wheelbase**: settings sliders. Wheelbase support isn't available yet; it will come with Volgas's own wheelbase firmware.
+- **Home**: the whole rig at a glance - the steering wheel, live throttle and brake, and the dash with the game it's showing. Every card shows whether its device is connected.
+- **Pedals**: live readings, a guided calibration wizard and response curves, with a marker showing where each pedal is on its curve right now. The pedals are found automatically over USB.
+- **Dash**: a live picture of what the dash screen is showing.
 - **Dash bridge**: runs in the background and sends rFactor 2 or Forza Horizon 5 telemetry to the dash, whichever game is running.
-- **Settings**: click the Volgas logo in the title bar. This shows the version and checks for and installs updates.
+- **Settings** (bottom of the left bar): the version, updates, and where Volgas keeps its settings and log files.
+- **Wheelbase**: hidden until wheelbase support exists (it will come with Volgas's own wheelbase firmware). Settings → Support can show it again.
+
+The title bar always shows whether the pedals and dash are connected and which game is running.
+
+Settings and logs live in `%APPDATA%\Volgas` (Windows). Settings from older versions, kept next to `Volgas.exe`, are copied over automatically the first time. If something goes wrong, Settings → Support → **Open log folder** has the log to attach to a bug report.
 
 ## Download
 
@@ -34,12 +38,21 @@ Click **More info → Run anyway**.
 Windows, Python 3.12:
 
 ```
-pip install pyserial pillow certifi pyinstaller
 cd pc_app
-python -m PyInstaller --onefile --windowed --name Volgas --icon assets/volgas.ico --add-data "assets/volgas_logo.png;assets" --add-data "assets/volgas.ico;assets" --add-data "assets/volgas_wheel.png;assets" volgas.py
+pip install -r requirements-dev.txt
+python -m pytest -q tests
+python -m PyInstaller Volgas.spec
 ```
 
 `python volgas.py` also runs it directly. The firmware folders are Arduino sketches.
+
+### Running without the hardware
+
+`python tools/simulate.py` starts Volgas with a simulated pedal board, dash and Forza game, on Windows, macOS or Linux. Options: `--no-pedals`, `--no-dash`, `--no-game`, and `--unplug 20` to pull the pedals out after 20 seconds and plug them back in 10 seconds later. It uses a temporary settings folder unless `--keep-settings` is given. Simulated runs check the app's own logic and screens, not the real hardware's timing.
+
+### Automated checks
+
+Every push runs the tests on Windows and Linux and builds `Volgas.exe` (see `.github/workflows/ci.yml`); the exe and its SHA-256 file are attached to the run as an artifact.
 
 ## Licence
 

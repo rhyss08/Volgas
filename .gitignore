@@ -46,3 +46,6 @@ pc_app/VolgasFlasher.spec
 pc_app/firmware/
 pc_app/PedalControl.spec
 pc_app/assets/make_icon.py
+
+# Test caches
+.pytest_cache/
