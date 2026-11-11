@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Sharper text and shapes on laptops with display scaling (125%, 150%): Windows now re-renders them at full resolution instead of stretching the window. Photos are still stretched.
+- New installer, `VolgasSetup.exe`: installs for your Windows account without admin rights, adds a Start menu entry, and lists Volgas under Settings → Apps with an Uninstall button. The in-app updater keeps working, and the installed-apps entry follows its updates. `Volgas.exe` on its own still works.
+
 ## 0.3.0 (2026-11-11)
 
 Phases 0 and 1 of the improvement plan (safety net and reliability), plus the first part of the new interface.

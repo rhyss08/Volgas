@@ -27,10 +27,15 @@ Settings and logs live in `%APPDATA%\Volgas` (Windows). Settings from older vers
 
 ## Download
 
-Get `Volgas.exe` from the [latest release](https://github.com/rhyss08/Volgas/releases/latest)
-and run it. There's no installer, and Volgas updates itself from the Settings page.
+Get `VolgasSetup.exe` from the [latest release](https://github.com/rhyss08/Volgas/releases/latest)
+and run it. It installs Volgas for your Windows account only (no admin rights needed), adds it
+to the Start menu, and lists it under Settings → Apps so it can be uninstalled like any other
+app. Volgas then updates itself from the Settings page. Uninstalling keeps your settings in
+`%APPDATA%\Volgas`.
 
-The exe isn't code-signed, so Windows SmartScreen may say "Windows protected your PC".
+`Volgas.exe` on its own still works too: put it anywhere and run it.
+
+Neither file is code-signed, so Windows SmartScreen may say "Windows protected your PC".
 Click **More info → Run anyway**.
 
 ## Building from source
@@ -46,13 +51,22 @@ python -m PyInstaller Volgas.spec
 
 `python volgas.py` also runs it directly. The firmware folders are Arduino sketches.
 
+To build the installer as well, install [Inno Setup 6.3+](https://jrsoftware.org/isinfo.php)
+and run, after PyInstaller (use the version in `volgas.py`):
+
+```
+iscc /DAppVersion=0.3.0 installer\Volgas.iss
+```
+
+It writes `dist\VolgasSetup.exe`.
+
 ### Running without the hardware
 
 `python tools/simulate.py` starts Volgas with a simulated pedal board, dash and Forza game, on Windows, macOS or Linux. Options: `--no-pedals`, `--no-dash`, `--no-game`, and `--unplug 20` to pull the pedals out after 20 seconds and plug them back in 10 seconds later. It uses a temporary settings folder unless `--keep-settings` is given. Simulated runs check the app's own logic and screens, not the real hardware's timing.
 
 ### Automated checks
 
-Every push runs the tests on Windows and Linux and builds `Volgas.exe` (see `.github/workflows/ci.yml`); the exe and its SHA-256 file are attached to the run as an artifact.
+Every push runs the tests on Windows and Linux and builds `Volgas.exe` and `VolgasSetup.exe` (see `.github/workflows/ci.yml`); both, plus the exe's SHA-256 file, are attached to the run as an artifact.
 
 ## Licence
 

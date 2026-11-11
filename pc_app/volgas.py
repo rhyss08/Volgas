@@ -2818,6 +2818,33 @@ def _enable_sharp_scaling():
         log.info("GDI scaling unavailable on this Windows version")
 
 
+# Same AppId as installer/Volgas.iss; Inno Setup names the uninstall entry after it.
+INSTALLER_APP_ID = "{A20B26BF-623F-447E-8E63-8A219892D06C}"
+
+
+def _sync_installed_version():
+    """The installer records the version in Windows' installed-apps list, but
+    the in-app updater swaps the exe without the installer, so that entry
+    would keep showing the old version. Correct it on start - only for the
+    copy the installer put there, not a separately downloaded Volgas.exe."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    import winreg
+    path = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{INSTALLER_APP_ID}_is1"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            location, _ = winreg.QueryValueEx(key, "InstallLocation")
+            here = os.path.dirname(sys.executable)
+            if os.path.normcase(os.path.normpath(location)) != os.path.normcase(os.path.normpath(here)):
+                return
+            shown, _ = winreg.QueryValueEx(key, "DisplayVersion")
+            if shown != VOLGAS_VERSION:
+                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, VOLGAS_VERSION)
+                log.info("installed-apps entry updated from %s to %s", shown, VOLGAS_VERSION)
+    except OSError:
+        pass  # not installed with the installer
+
+
 def _report_callback_exception(exc_type, exc, tb):
     """Tk swallows exceptions raised in event handlers and timers into
     stderr, which a windowed exe doesn't have - log them instead."""
@@ -2829,6 +2856,7 @@ if __name__ == "__main__":
     log.info("Volgas %s starting (Python %s, %s), log: %s", VOLGAS_VERSION, sys.version.split()[0], sys.platform,
              log_path)
     _enable_sharp_scaling()
+    _sync_installed_version()
     root = tk.Tk()
     root.report_callback_exception = _report_callback_exception
     root.withdraw()
