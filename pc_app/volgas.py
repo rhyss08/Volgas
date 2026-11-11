@@ -53,6 +53,7 @@ def _restart_if_borrowing_unpack_folder():
 
 _restart_if_borrowing_unpack_folder()
 
+import logging
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -66,6 +67,17 @@ from collections import deque
 from PIL import Image, ImageDraw, ImageTk
 
 import volgas_dash_font
+import volgas_theme as T
+import volgas_ui as ui
+from volgas_log import setup_logging
+from volgas_pedal_protocol import (
+    MSG_STATUS, MSG_SET_CALIBRATION, MSG_SAVE, MSG_GET_CALIBRATION,
+    MSG_CALIBRATION, MSG_SAVE_ACK, CAL_FMT, STATUS_FMT, CAL_SIZE, STATUS_SIZE, AXIS_MAX,
+    THROTTLE_LIMITS, BRAKE_LIMITS, CAPTURE_SECONDS, find_pedal_port, build_frame, FrameParser,
+    summarise, check_calibration, linear_fraction)
+from volgas_settings import data_dir, log_dir, load_settings as _load_settings, save_settings as _save_settings
+
+log = logging.getLogger("volgas")
 
 try:
     # volgas_dash_bridge.py auto-picks rFactor2 or Forza Horizon 5, whichever is
@@ -77,6 +89,7 @@ try:
     from volgas_dash_bridge import DashBridge
     DASH_BRIDGE_AVAILABLE = True
 except Exception:
+    logging.getLogger("volgas").exception("dash bridge unavailable - the dash and game telemetry are disabled")
     DASH_BRIDGE_AVAILABLE = False
 
 
@@ -153,7 +166,15 @@ def _install_update(new_path):
     if os.path.exists(old):
         os.remove(old)
     os.rename(exe, old)
-    os.rename(new_path, exe)
+    try:
+        os.rename(new_path, exe)
+    except OSError:
+        # Put the running exe back under its own name, so a failed swap
+        # never leaves the user without a Volgas.exe to start.
+        log.exception("update swap failed - restoring the previous Volgas.exe")
+        os.rename(old, exe)
+        raise
+    log.info("installed update from %s", new_path)
     # Without the reset, the new exe - at the path this one was started from -
     # takes the inherited _PYI_* variables as its own and runs from this
     # process's unpack folder, which is deleted when this one exits (seen on
@@ -161,28 +182,6 @@ def _install_update(new_path):
     # FileNotFoundError for the assets).
     subprocess.Popen([exe], close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
 
-
-
-def _settings_path():
-    # Next to Volgas.exe on disk, not inside the onefile bundle's temp extraction dir.
-    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "volgas_settings.json")
-
-
-def _load_settings():
-    try:
-        with open(_settings_path(), "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_settings(settings):
-    try:
-        with open(_settings_path(), "w") as f:
-            json.dump(settings, f)
-    except Exception:
-        pass
 
 
 def asset_path(name):
@@ -194,7 +193,8 @@ def asset_path(name):
 # Startup splash, like the dash's showSplashScreen() in esp32_dash.ino: the
 # logo alone (no window background, no text) for 3 seconds.
 SPLASH_LOGO_SIZE = 300
-SPLASH_MS = 3000
+DEFAULT_WINDOW_W, DEFAULT_WINDOW_H = 1180, 760
+SPLASH_MS = 1500  # long enough to register, short enough not to be a wait
 SPLASH_KEY_COLOR = "#ff00ff"  # made see-through via -transparentcolor; not used anywhere in the logo
 
 
@@ -202,8 +202,13 @@ def show_splash(root):
     splash = tk.Toplevel(root)
     splash.overrideredirect(True)
     splash.attributes("-topmost", True)
-    splash.configure(bg=SPLASH_KEY_COLOR)
-    splash.attributes("-transparentcolor", SPLASH_KEY_COLOR)
+    if sys.platform == "win32":
+        splash.configure(bg=SPLASH_KEY_COLOR)
+        splash.attributes("-transparentcolor", SPLASH_KEY_COLOR)
+    else:
+        # -transparentcolor is Windows-only; elsewhere (development on macOS
+        # or Linux) show the logo on the app's background instead.
+        splash.configure(bg=T.SURFACE_WINDOW)
     x = (splash.winfo_screenwidth() - SPLASH_LOGO_SIZE) // 2
     y = (splash.winfo_screenheight() - SPLASH_LOGO_SIZE) // 2
     splash.geometry(f"{SPLASH_LOGO_SIZE}x{SPLASH_LOGO_SIZE}+{x}+{y}")
@@ -213,17 +218,12 @@ def show_splash(root):
     # soft alpha edge would blend into a magenta fringe - snap alpha to on/off.
     logo.putalpha(logo.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
     splash.logo_photo = ImageTk.PhotoImage(logo)
-    tk.Label(splash, image=splash.logo_photo, bg=SPLASH_KEY_COLOR, borderwidth=0).place(
+    tk.Label(splash, image=splash.logo_photo, bg=splash.cget("bg"), borderwidth=0).place(
         relx=0.5, rely=0.5, anchor="center")
     splash.update()  # paint it now - VolgasApp's build runs before mainloop starts
     return splash
 
 
-# USBComposite defaults to LeafLabs' VID; PID is the one pedal_set.ino
-# sets explicitly (bumped to 0x0003 when CDC serial was added). Used to
-# find the Pedal Set's COM port automatically instead of picking by name.
-PEDAL_VID = 0x1EAF
-PEDAL_PID = 0x0003
 
 # FFBeast support was removed (user, 2026-10-31) ahead of Volgas's own
 # wheelbase firmware, so nothing talks to a wheelbase right now. The Wheelbase
@@ -291,17 +291,20 @@ WB_NAME_FONT = ("Segoe UI", 10, "bold")
 # wheel rotation arc) - plain tk widgets with explicit colors, not ttk, so
 # this is fully self-contained and doesn't touch the other tabs' native ttk
 # look.
-MAIN_BG = "#07080b"
-MAIN_PANEL = "#131620"
-MAIN_BORDER = "#262b3a"
-MAIN_TEXT = "#eef0f6"
-MAIN_TEXT_DIM = "#8a91a8"
-MAIN_RED = "#ff3b3b"
-MAIN_BLUE = "#2f8fff"
-MAIN_GREEN = "#39e26a"
-MAIN_CYAN = "#3fd4e0"
-MAIN_GRAY = "#5a6178"
-MAIN_ORANGE_STATUS = "#e0a030"
+# Legacy names kept for the existing drawing code; the values now come from
+# the design tokens in volgas_theme (better card separation and readable
+# secondary text - MAIN_GRAY was 2.9:1 against cards, now 4.7:1).
+MAIN_BG = T.SURFACE_WINDOW
+MAIN_PANEL = T.SURFACE_CARD
+MAIN_BORDER = T.BORDER
+MAIN_TEXT = T.TEXT_PRIMARY
+MAIN_TEXT_DIM = T.TEXT_SECONDARY
+MAIN_RED = T.BRAKE
+MAIN_BLUE = T.BLUE
+MAIN_GREEN = T.THROTTLE
+MAIN_CYAN = T.ACCENT
+MAIN_GRAY = T.TEXT_HINT
+MAIN_ORANGE_STATUS = T.STATUS_WARN
 
 
 def _rate_limited(widget, fn, interval_ms):
@@ -595,18 +598,6 @@ def _render_dash(state):
     return img
 
 
-SYNC0, SYNC1 = 0xAA, 0x55
-MSG_STATUS = 0x01
-MSG_SET_CALIBRATION = 0x02
-MSG_SAVE = 0x03
-MSG_GET_CALIBRATION = 0x04
-MSG_CALIBRATION = 0x84
-MSG_SAVE_ACK = 0x83
-
-# Must match pedal_protocol.h byte-for-byte (packed, little-endian).
-CAL_FMT = "<hhii5B5B"        # hallMin hallMax loadMin loadMax throttleCurve[5] brakeCurve[5]
-STATUS_FMT = "<hhiHH"        # hallRaw hallFiltered loadRaw throttleAxis brakeAxis
-
 # Curve presets (output % at input breakpoints 0/25/50/75/100%) offered as
 # one-click buttons next to each pedal's 5 curve sliders.
 CURVE_PRESET_LINEAR = (0, 25, 50, 75, 100)
@@ -618,65 +609,6 @@ CURVE_PRESET_REVERSE_EXPONENTIAL = (0, 50, 71, 87, 100)
 # pre-connect.
 DEFAULT_THROTTLE_CURVE = (0, 44, 66, 84, 100)
 DEFAULT_BRAKE_CURVE = CURVE_PRESET_LINEAR
-CAL_SIZE = struct.calcsize(CAL_FMT)
-STATUS_SIZE = struct.calcsize(STATUS_FMT)
-
-
-def find_pedal_port():
-    """Return the COM port of the Pedal Set by USB VID/PID, or None."""
-    for p in serial.tools.list_ports.comports():
-        if p.vid == PEDAL_VID and p.pid == PEDAL_PID:
-            return p.device
-    return None
-
-
-def build_frame(msg_type, payload=b""):
-    checksum = (msg_type + len(payload) + sum(payload)) & 0xFF
-    return bytes([SYNC0, SYNC1, msg_type, len(payload)]) + payload + bytes([checksum])
-
-
-class FrameParser:
-    """Same resync state machine as the firmware side."""
-
-    def __init__(self, on_frame):
-        self.on_frame = on_frame
-        self.reset()
-
-    def reset(self):
-        self.state = "SYNC0"
-        self.msg_type = 0
-        self.length = 0
-        self.payload = bytearray()
-        self.checksum = 0
-
-    def feed(self, data):
-        for b in data:
-            if self.state == "SYNC0":
-                if b == SYNC0:
-                    self.state = "SYNC1"
-            elif self.state == "SYNC1":
-                self.state = "TYPE" if b == SYNC1 else "SYNC0"
-            elif self.state == "TYPE":
-                self.msg_type = b
-                self.checksum = b
-                self.state = "LEN"
-            elif self.state == "LEN":
-                if b > 32:
-                    self.state = "SYNC0"
-                    continue
-                self.length = b
-                self.checksum = (self.checksum + b) & 0xFF
-                self.payload = bytearray()
-                self.state = "PAYLOAD" if b else "CHECKSUM"
-            elif self.state == "PAYLOAD":
-                self.payload.append(b)
-                self.checksum = (self.checksum + b) & 0xFF
-                if len(self.payload) >= self.length:
-                    self.state = "CHECKSUM"
-            elif self.state == "CHECKSUM":
-                if b == self.checksum:
-                    self.on_frame(self.msg_type, bytes(self.payload))
-                self.state = "SYNC0"
 
 
 def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=18, interior_leak_min_area=400):
@@ -839,7 +771,9 @@ class VolgasApp:
         self.ser = None
         self.reader = None
         self.rx_queue = queue.Queue()
-        self.parser = FrameParser(lambda t, p: self.rx_queue.put((t, p)))
+        self._pedal_stop = None   # stop event of the current pedal connection's reader
+        self._cal_loaded = False  # True once the pedals' own calibration has been read this connection
+        self._pedal_live = {"throttle": None, "brake": None}  # 0..1 input position, for the curve markers
         self.last_status = None
 
         # Raw calibration endpoints - not user-editable text fields anymore
@@ -861,104 +795,119 @@ class VolgasApp:
         self._wb_settings = _load_settings()
         self._wb_remembered = self._wb_settings.setdefault("wheelbase", {})
 
-        # A plain custom tab bar instead of ttk.Notebook, styled to match
-        # the dark theme, that doubles as the title bar - see
-        # _build_window_chrome and _hook_caption.
+        # Layout: the title bar across the top (row 0), a navigation rail
+        # down the left and the current page beside it (row 1). Pages are
+        # device-centred, Home first - see _build_home_tab.
+        self._show_wheelbase = bool(self._wb_settings.get("show_wheelbase", False))
         self.root.rowconfigure(1, weight=1)
-        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(1, weight=1)
         content = tk.Frame(self.root, bg=MAIN_BG)
-        content.grid(row=1, column=0, sticky="nsew")
+        content.grid(row=1, column=1, sticky="nsew")
         content.grid_rowconfigure(0, weight=1)
         content.grid_columnconfigure(0, weight=1)
 
-        main_tab = tk.Frame(content, bg=MAIN_BG)
-        pedals_tab = tk.Frame(content, bg=MAIN_BG)
-        wheelbase_tab = tk.Frame(content, bg=MAIN_BG)
-        dashboard_tab = tk.Frame(content, bg=MAIN_BG)
-        # Settings has no tab button - it's opened by clicking the logo.
-        settings_tab = tk.Frame(content, bg=MAIN_BG)
-        self._tab_frames = {"Main": main_tab, "Pedals": pedals_tab, "Wheelbase": wheelbase_tab,
-                            "Dashboard": dashboard_tab,
-                            "Settings": settings_tab}
+        page_names = ["Home", "Pedals", "Dash"]
+        if self._show_wheelbase:
+            # Hidden by default (no wheelbase backend exists yet); enable with
+            # "show_wheelbase": true in the settings file. Saved wheelbase
+            # values are kept either way.
+            page_names.append("Wheelbase")
+        page_names.append("Settings")
+        self._tab_frames = {name: tk.Frame(content, bg=MAIN_BG) for name in page_names}
         for frame in self._tab_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
 
         self._update_queue = queue.Queue()
         self._update_busy = False
-        self._build_main_tab(main_tab)
-        self._build_pedals_tab(pedals_tab)
-        self._build_wheelbase_tab(wheelbase_tab)
         self._dash_bridge = DashBridge() if DASH_BRIDGE_AVAILABLE else None
-        self._build_dashboard_tab(dashboard_tab)
-        self._build_settings_tab(settings_tab)
+        self._build_home_tab(self._tab_frames["Home"])
+        self._build_pedals_tab(self._tab_frames["Pedals"])
+        if self._show_wheelbase:
+            self._build_wheelbase_tab(self._tab_frames["Wheelbase"])
+        self._build_dashboard_tab(self._tab_frames["Dash"])
+        self._build_settings_tab(self._tab_frames["Settings"])
         self._caption_hwnd = _hook_caption(self.root)
-        self._build_window_chrome([n for n in self._tab_frames if n != "Settings"])
+        self._build_window_chrome()
+        self._build_nav_rail()
+        self.toaster = ui.Toaster(self.root)
 
-        # Floor the window at the size its content actually asks for (driven
-        # by the Main tab's card/gauge minimum sizes, see _build_main_tab).
-        # The native resize border is kept (see _hook_caption), so Windows
+        # Floor the window at the size its content actually asks for. The
+        # native resize border is kept (see _hook_caption), so Windows
         # enforces this during an interactive resize like any other app.
         self.root.update_idletasks()
         req_w, req_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         self.root.minsize(req_w, req_h)
-        # Measured with every tab still gridded, so the floor fits the
-        # biggest tab. The explicit geometry stops the window following its
-        # requested size once only one tab is gridded, so switching tabs
+        # Measured with every page still gridded, so the floor fits the
+        # biggest page. The explicit geometry stops the window following its
+        # requested size once only one page is gridded, so switching pages
         # doesn't resize it.
-        self.root.geometry(f"{req_w}x{req_h}")
-        self._select_tab(next(iter(self._tab_frames)))
-        _apply_dark_titlebar(self.root, MAIN_BG, MAIN_BORDER, MAIN_TEXT)
+        # Open roomier than the minimum when the screen allows it.
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        start_w = max(req_w, min(DEFAULT_WINDOW_W, int(screen_w * 0.9)))
+        start_h = max(req_h, min(DEFAULT_WINDOW_H, int(screen_h * 0.85)))
+        self.root.geometry(f"{start_w}x{start_h}")
+        self._select_tab("Home")
+        _apply_dark_titlebar(self.root, T.SURFACE_RAIL, MAIN_BORDER, MAIN_TEXT)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._closing = False
 
         self._poll()
         self._auto_scan()
+        self._bridge_stop = threading.Event()
+        self._bridge_thread = None
         if DASH_BRIDGE_AVAILABLE:
-            # No tab of its own any more: the bridge runs in the background for
-            # the app's whole lifetime, finding the dash, picking up rFactor2 or
-            # Forza and reconnecting by itself (see volgas_dash_bridge).
-            threading.Thread(target=lambda: self._dash_bridge.run(threading.Event()), daemon=True).start()
+            # The bridge runs in the background for the app's whole lifetime,
+            # finding the dash, picking up rFactor2 or Forza and reconnecting
+            # by itself (see volgas_dash_bridge). _on_close stops it.
+            self._bridge_thread = threading.Thread(target=self._dash_bridge.run, args=(self._bridge_stop,),
+                                                   name="dash-bridge", daemon=True)
+            self._bridge_thread.start()
+        self._status_poll()
         self._remove_old_exe()
         if self._wb_settings.get("check_updates_on_start", True):
             self._start_update_check()
 
     # ---------- window chrome (dark tab strip as the title bar) ----------
 
-    def _build_window_chrome(self, tab_names):
-        """The tab strip, styled to match the dark theme and replacing
-        ttk.Notebook's own tab widget. With the native caption removed (see
-        _hook_caption) it is also the title bar: its empty space drags the
-        window (handing off to Windows' own move loop, so Snap and
-        drag-to-restore work), double-click maximizes, its top few pixels
-        resize, and it carries the min/max/close buttons. If the hook isn't
-        in place the native title bar stays above it instead."""
-        bar = tk.Frame(self.root, bg=MAIN_PANEL, height=TITLE_BAR_H)
-        bar.grid(row=0, column=0, sticky="ew")
+    def _build_window_chrome(self):
+        """The title bar: the Volgas mark, the current page's name, and live
+        status pills for the pedals, the dash and the game - so the state of
+        the rig is visible from every page. With the native caption removed
+        (see _hook_caption) it is also the window's title bar: its empty
+        space drags the window (handing off to Windows' own move loop, so
+        Snap and drag-to-restore work), double-click maximizes, its top few
+        pixels resize, and it carries the min/max/close buttons. If the hook
+        isn't in place the native title bar stays above it instead."""
+        bar = tk.Frame(self.root, bg=T.SURFACE_RAIL, height=TITLE_BAR_H)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         bar.pack_propagate(False)
-        self.root.columnconfigure(0, weight=1)
 
-        # The Volgas mark leads the bar; clicking it opens the Settings page.
         logo_size = 24
         logo_im = Image.open(asset_path("volgas_logo.png")).convert("RGBA").resize((logo_size, logo_size), Image.LANCZOS)
         self._logo_photo = ImageTk.PhotoImage(logo_im)
-        logo = tk.Label(bar, image=self._logo_photo, bg=MAIN_PANEL, cursor="hand2")
-        logo.pack(side="left", padx=(14, 8))
-        logo.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
+        logo = tk.Label(bar, image=self._logo_photo, bg=T.SURFACE_RAIL)
+        # Centred over the navigation rail below it.
+        logo.pack(side="left", padx=((T.NAV_RAIL_W - logo_size) // 2, T.SPACE_3))
+        self._page_title = tk.Label(bar, text="", font=T.FONT_LABEL, fg=T.TEXT_PRIMARY, bg=T.SURFACE_RAIL)
+        self._page_title.pack(side="left")
 
-        self._tab_buttons = {}
-        for name in tab_names:
-            btn = tk.Label(bar, text=name.upper(), font=("Segoe UI", 9, "bold"),
-                            fg=MAIN_TEXT_DIM, bg=MAIN_PANEL, padx=14, cursor="hand2")
-            btn.pack(side="left", fill="y")
-            btn.bind("<Button-1>", lambda _e, n=name: self._select_tab(n))
-            self._tab_buttons[name] = btn
-
-        # Shown after the tabs when an update check finds a newer release.
-        self._update_badge = tk.Label(bar, text="Update available", font=("Segoe UI", 9, "bold"),
-                                      fg=MAIN_CYAN, bg=MAIN_PANEL, cursor="hand2")
+        # Shown when an update check finds a newer release.
+        self._update_badge = ui.StatusPill(bar, "warn", "Update available", bg=T.SURFACE_RAIL)
+        self._update_badge.config(cursor="hand2")
         self._update_badge.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
+
+        if self._caption_hwnd:
+            self._build_caption_buttons(bar)
+        pills = tk.Frame(bar, bg=T.SURFACE_RAIL)
+        pills.pack(side="right", padx=(0, T.SPACE_3))
+        self._game_pill = ui.StatusPill(pills, "idle", "No game", bg=T.SURFACE_RAIL)
+        self._dash_pill = ui.StatusPill(pills, "idle", "Dash", bg=T.SURFACE_RAIL)
+        self._pedal_pill = ui.StatusPill(pills, "idle", "Pedals", bg=T.SURFACE_RAIL)
+        for pill in (self._game_pill, self._dash_pill, self._pedal_pill):
+            pill.pack(side="right", padx=(T.SPACE_2, 0))
 
         if not self._caption_hwnd:
             return
-        self._build_caption_buttons(bar)
         self._bar_press = None
         bar.bind("<ButtonPress-1>", self._on_bar_press)
         bar.bind("<B1-Motion>", self._on_bar_drag)
@@ -985,12 +934,12 @@ class VolgasApp:
                    ("min", lambda: user32.PostMessageW(self._caption_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0),
                     MAIN_BORDER))
         for key, action, hover_bg in buttons:
-            btn = tk.Canvas(bar, width=CAPTION_BUTTON_W, height=TITLE_BAR_H, bg=MAIN_PANEL, highlightthickness=0)
+            btn = tk.Canvas(bar, width=CAPTION_BUTTON_W, height=TITLE_BAR_H, bg=T.SURFACE_RAIL, highlightthickness=0)
             btn.create_text(CAPTION_BUTTON_W // 2, TITLE_BAR_H // 2, text=CAPTION_GLYPHS[key],
                             font=glyph_font, fill=MAIN_TEXT, tags="glyph")
             btn.pack(side="right", fill="y")
             btn.bind("<Enter>", lambda _e, b=btn, bg=hover_bg: b.config(bg=bg))
-            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=MAIN_PANEL))
+            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=T.SURFACE_RAIL))
             # Acts on release over the button, like the native ones.
             btn.bind("<ButtonRelease-1>",
                      lambda e, a=action: a() if 0 <= e.x < e.widget.winfo_width()
@@ -1077,11 +1026,31 @@ class VolgasApp:
             self._start_native_drag(hit, event)
             return "break"
 
+    PAGE_TITLES = {"Home": "Home", "Pedals": "Pedals", "Dash": "Dash", "Wheelbase": "Wheelbase",
+                   "Settings": "Settings"}
+
+    def _build_nav_rail(self):
+        """Page navigation down the left edge, Settings pinned at the bottom
+        where people expect it (it used to be reachable only by clicking the
+        logo)."""
+        self._nav = ui.NavRail(self.root, on_select=self._select_tab)
+        self._nav.grid(row=1, column=0, sticky="ns")
+        self._nav.add("Home", "Home", "home")
+        self._nav.add("Pedals", "Pedals", "pedals")
+        self._nav.add("Dash", "Dash", "dash")
+        if self._show_wheelbase:
+            self._nav.add("Wheelbase", "Base", "base")
+        self._nav.add("Settings", "Settings", "settings", bottom=True)
+
     def _select_tab(self, name):
-        for n, btn in self._tab_buttons.items():
-            selected = n == name
-            btn.config(bg=MAIN_BG if selected else MAIN_PANEL, fg=MAIN_TEXT if selected else MAIN_TEXT_DIM)
-        # Hidden tabs are taken out of the grid, not just stacked underneath
+        if name not in self._tab_frames:
+            return
+        self._current_page = name
+        if hasattr(self, "_nav"):
+            self._nav.select(name)
+        if hasattr(self, "_page_title"):
+            self._page_title.config(text=self.PAGE_TITLES.get(name, name))
+        # Hidden pages are taken out of the grid, not just stacked underneath
         # with tkraise(): stacked ones still got laid out and redrawn on
         # every resize event, which made dragging the window edge lag.
         for n, frame in self._tab_frames.items():
@@ -1089,102 +1058,163 @@ class VolgasApp:
                 frame.grid()
             else:
                 frame.grid_remove()
-        # A wheel card on the tab just shown skipped redraws while hidden -
+        # A wheel card on the page just shown skipped redraws while hidden -
         # catch it up once grid has mapped it (idle, after the layout pass).
         self.root.after_idle(self._refresh_wheel_cards)
         if name == "Wheelbase" and self.wb_connected:
-            # Refresh its fields from the device every time it's opened -
-            # they otherwise only got populated once, right after connect,
-            # and would show stale values after anything changed them
-            # elsewhere (e.g. the Main tab's sliders). Queued directly
-            # (not via _wb_send_command) so switching tabs while
-            # disconnected doesn't pop up a warning dialog.
+            # Refresh its fields from the device every time it's opened.
             self.wb_cmd_queue.put(("read_settings",))
 
     def _show_update_badge(self, show):
         if show:
-            self._update_badge.pack(side="left", fill="y", padx=(12, 0))
+            self._update_badge.pack(side="left", padx=(T.SPACE_3, 0))
         else:
             self._update_badge.pack_forget()
+        if hasattr(self, "_nav"):
+            self._nav.set_badge("Settings", show)
+
+    def _notify(self, text, kind="info"):
+        """Non-blocking message in the window corner (replaces pop-ups for
+        anything that doesn't need a decision)."""
+        log.info("notice (%s): %s", kind, text)
+        if hasattr(self, "toaster"):
+            self.toaster.show(text, kind)
 
     # ---------- UI ----------
 
-    def _build_main_tab(self, parent):
+    def _build_home_tab(self, parent):
+        """Home: the whole rig at a glance, one card per device. The wheel
+        fills the left side with its photo; the pedals and the dash share the
+        right. Every card shows its device's real connection state."""
         root = tk.Frame(parent, bg=MAIN_BG)
-        root.pack(fill="both", expand=True)
-        root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(1, weight=1)  # the card row is the only part that grows tall
+        root.pack(fill="both", expand=True, padx=T.SPACE_5, pady=(T.SPACE_4, T.SPACE_5))
+        root.grid_columnconfigure(0, weight=23, uniform="home")
+        root.grid_columnconfigure(1, weight=20, uniform="home")
+        root.grid_rowconfigure(0, weight=1, uniform="home-rows")
+        root.grid_rowconfigure(1, weight=1, uniform="home-rows")
 
-        # ---- top bar: compact controls (status/enable/range/centre) ----
-        # No brand/logo here - the window chrome bar (see
-        # _build_window_chrome) is the only branding-free header now.
-        top = tk.Frame(root, bg=MAIN_BG)
-        top.grid(row=0, column=0, sticky="ew", padx=20, pady=(12, 8))
-
-        right_box = tk.Frame(top, bg=MAIN_BG)
-        right_box.pack(side="right")
-        self.main_wb_status_label = tk.Label(right_box, text="wheelbase: --", font=("Segoe UI", 9),
-                                              fg=MAIN_GRAY, bg=MAIN_BG, padx=12)
-        self.main_wb_status_label.pack(side="right")
-
+        # Wheelbase values the optional Wheelbase page shares (no controls on
+        # Home while the wheelbase isn't available).
         self.main_forces_enabled_var = tk.BooleanVar(value=bool(self._wb_remembered.get("ForceEnabled", 0)))
-        enable_box = tk.Frame(right_box, bg=MAIN_BG)
-        enable_box.pack(side="right", padx=(0, 16))
-        tk.Label(enable_box, text="Forces", font=("Segoe UI", 9),
-                 fg=MAIN_TEXT, bg=MAIN_BG).pack(side="left", padx=(0, 4))
-        self.main_forces_toggle = tk.Canvas(enable_box, width=40, height=20, bg=MAIN_BG, highlightthickness=0)
-        self.main_forces_toggle.pack(side="left")
-        self.main_forces_toggle.bind("<Button-1>", self._on_forces_enabled_toggle)
-        self._redraw_forces_toggle()
+        self.main_force_strength_var = tk.DoubleVar(value=self._wb_remembered.get("PowerLimit", 15))
+        self.main_motion_range_var = tk.DoubleVar(value=self._wb_remembered.get("MotionRange", 360))
 
-        # ---- middle row: brake | wheel rotation | throttle glow cards ----
-        # Grid (not pack) with column/row weights so the cards genuinely
-        # resize - not just sit centered with extra blank space - as the
-        # window grows, matching the rest of this tab's resizable layout.
-        row = tk.Frame(root, bg=MAIN_BG)
-        row.grid(row=1, column=0, sticky="nsew", padx=20, pady=8)
-        row.grid_columnconfigure(0, weight=1)
-        row.grid_columnconfigure(1, weight=2)
-        row.grid_columnconfigure(2, weight=1)
-        row.grid_rowconfigure(0, weight=1)
+        wheel_card = self._build_wheel_card(root, width=470, height=470, wheelbase_controls=False)
+        wheel_card.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, T.SPACE_3))
 
-        brake_card, self.main_brake_update = self._build_glow_pedal_card(row, "BRAKE", MAIN_RED)
-        brake_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        pedals_card = self._build_home_pedals_card(root)
+        pedals_card.grid(row=0, column=1, sticky="nsew", pady=(0, T.SPACE_2))
 
-        wheel_card = self._build_wheel_card(row)
-        wheel_card.grid(row=0, column=1, sticky="nsew", padx=12)
+        dash_card = self._build_home_dash_card(root)
+        dash_card.grid(row=1, column=1, sticky="nsew", pady=(T.SPACE_2, 0))
 
-        throttle_card, self.main_throttle_update = self._build_glow_pedal_card(row, "THROTTLE", MAIN_GREEN)
-        throttle_card.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+    def _make_frame_card(self, parent, width, height):
+        """A rounded card holding an ordinary Frame, for content laid out with
+        regular widgets. Returns (card, inner_frame)."""
+        card = self._make_flat_card(parent, width, height)
+        inner = tk.Frame(card, bg=MAIN_PANEL)
+        win = card.create_window(T.SPACE_4, T.SPACE_4, window=inner, anchor="nw")
+        card.bind("<Configure>", lambda e: card.itemconfig(
+            win, width=max(1, e.width - 2 * T.SPACE_4), height=max(1, e.height - 2 * T.SPACE_4)), add="+")
+        return card, inner
 
-        # ---- bottom: Force Feedback Intensity + Steering Range, sharing one card ----
-        # Fixed height, so only x positions change on resize. y offsets are
-        # the ones the old packed Label/Canvas/Label stack had.
-        ffb_card = self._make_flat_card(root, 190 + 12 + 600 + 12 + 190, 290)
-        ffb_card.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 20))
-        saved_strength = self._wb_remembered.get("PowerLimit", 15)
-        self.main_force_strength_var = tk.DoubleVar(value=saved_strength)
-        self._add_card_hbar(
-            ffb_card, 0, "FORCE FEEDBACK INTENSITY", self.main_force_strength_var, 1, 100, MAIN_BLUE,
-            lambda v: f"{round(v)}% FFB", self._on_force_strength_release)
+    def _card_header(self, inner, title):
+        """Title on the left, status pill on the right. Returns the pill."""
+        header = tk.Frame(inner, bg=MAIN_PANEL)
+        header.pack(side="top", fill="x")
+        tk.Label(header, text=title, font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(side="left")
+        pill = ui.StatusPill(header, "idle", "Checking...", bg=MAIN_PANEL)
+        pill.pack(side="right")
+        return pill
 
-        saved_range = self._wb_remembered.get("MotionRange", 360)
-        self.main_motion_range_var = tk.DoubleVar(value=saved_range)
-        self._add_card_hbar(
-            ffb_card, 101, "STEERING RANGE", self.main_motion_range_var, 90, 1080, MAIN_CYAN,
-            lambda v: f"{int(round(v))}°", self._on_motion_range_release)
+    def _build_home_pedals_card(self, parent):
+        card, inner = self._make_frame_card(parent, 420, 262)
+        self._home_pedal_pill = self._card_header(inner, "Pedals")
 
-        preset_box = tk.Frame(ffb_card, bg=MAIN_PANEL)
-        for label, deg in (("360°", 360), ("540°", 540), ("900°", 900)):
-            tk.Button(preset_box, text=label, font=("Segoe UI", 9), fg=MAIN_TEXT,
-                      bg=MAIN_BORDER, activebackground=MAIN_CYAN, activeforeground=MAIN_BG,
-                      relief="flat", padx=16, pady=4, bd=0, cursor="hand2",
-                      command=lambda d=deg: self._set_motion_range_preset(d)).pack(side="left", padx=6)
-        preset_y = CARD_PAD + 208 + 14
-        preset_id = ffb_card.create_window(ffb_card.winfo_reqwidth() / 2, preset_y, window=preset_box)
-        ffb_card.bind("<Configure>", lambda e: ffb_card.coords(preset_id, e.width / 2, preset_y), add="+")
+        body = tk.Frame(inner, bg=MAIN_PANEL)
+        body.pack(side="top", fill="both", expand=True, pady=(T.SPACE_3, T.SPACE_2))
+        body.grid_columnconfigure(0, weight=1, uniform="pedal")
+        body.grid_columnconfigure(1, weight=1, uniform="pedal")
 
-    def _make_flat_card(self, parent, width, height, radius=20, outline=MAIN_BORDER):
+        def gauge(column, name, color):
+            box = tk.Frame(body, bg=MAIN_PANEL)
+            box.grid(row=0, column=column, sticky="nsew", padx=(0, T.SPACE_3) if column == 0 else (T.SPACE_3, 0))
+            tk.Label(box, text=name, font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL).pack(anchor="w")
+            value = tk.Label(box, text="--", font=T.FONT_DISPLAY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL)
+            value.pack(anchor="w")
+            bar = tk.Canvas(box, height=10, bg=MAIN_PANEL, highlightthickness=0)
+            bar.pack(fill="x", pady=(T.SPACE_1, 0))
+            track = ui.draw_round_rect(bar, 0, 0, 10, 10, 5, fill=T.SURFACE_RAISED, outline="")
+            fill = ui.draw_round_rect(bar, 0, 0, 0, 10, 5, fill=color, outline="")
+            state = {"raw": None, "shown": None}
+
+            def redraw(_e=None):
+                w = bar.winfo_width()
+                if w <= 1:
+                    return
+                bar.coords(track, *ui.round_rect_points(0, 0, w, 10, 5))
+                frac = 0.0 if state["raw"] is None else max(0.0, min(1.0, state["raw"] / AXIS_MAX))
+                if frac <= 0.01:
+                    bar.itemconfig(fill, state="hidden")
+                else:
+                    bar.itemconfig(fill, state="normal")
+                    bar.coords(fill, *ui.round_rect_points(0, 0, max(10, w * frac), 10, 5))
+
+            def update(raw):
+                state["raw"] = raw
+                text = "--" if raw is None else f"{round(max(0.0, min(1.0, raw / AXIS_MAX)) * 100)}%"
+                if text != state["shown"]:
+                    state["shown"] = text
+                    value.config(text=text, fg=T.TEXT_PRIMARY if raw is not None else T.TEXT_HINT)
+                if bar.winfo_viewable():
+                    redraw()
+
+            bar.bind("<Configure>", redraw)
+            return update
+
+        self.main_throttle_update = gauge(0, "Throttle", MAIN_GREEN)
+        self.main_brake_update = gauge(1, "Brake", MAIN_RED)
+
+        footer = tk.Frame(inner, bg=MAIN_PANEL)
+        footer.pack(side="bottom", fill="x")
+        self._home_pedal_note = tk.Label(footer, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
+        self._home_pedal_note.pack(side="left")
+        ui.FlatButton(footer, "Open pedals", command=lambda: self._select_tab("Pedals"),
+                      font=T.FONT_CAPTION).pack(side="right")
+        self.main_throttle_update(None)
+        self.main_brake_update(None)
+        return card
+
+    def _build_home_dash_card(self, parent):
+        card, inner = self._make_frame_card(parent, 420, 262)
+        self._home_dash_pill = self._card_header(inner, "Dash")
+
+        body = tk.Frame(inner, bg=MAIN_PANEL)
+        body.pack(side="top", fill="both", expand=True, pady=(T.SPACE_3, T.SPACE_2))
+        self._home_dash_image = tk.Label(body, bg=MAIN_BG, bd=0, highlightthickness=1,
+                                         highlightbackground=MAIN_BORDER)
+        self._home_dash_image.pack(side="left", anchor="n")
+        self._home_dash_shown = None
+        info = tk.Frame(body, bg=MAIN_PANEL)
+        info.pack(side="left", fill="both", expand=True, padx=(T.SPACE_4, 0))
+        tk.Label(info, text="Game", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL).pack(anchor="w")
+        self._home_game_label = tk.Label(info, text="--", font=T.FONT_LABEL, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL)
+        self._home_game_label.pack(anchor="w")
+        tk.Label(info, text="Showing", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
+                 bg=MAIN_PANEL).pack(anchor="w", pady=(T.SPACE_2, 0))
+        self._home_dash_detail = tk.Label(info, text="--", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL,
+                                          justify="left", wraplength=210)
+        self._home_dash_detail.pack(anchor="w")
+
+        footer = tk.Frame(inner, bg=MAIN_PANEL)
+        footer.pack(side="bottom", fill="x")
+        self._home_dash_note = tk.Label(footer, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
+        self._home_dash_note.pack(side="left")
+        ui.FlatButton(footer, "Open dash", command=lambda: self._select_tab("Dash"),
+                      font=T.FONT_CAPTION).pack(side="right")
+        return card
+
+    def _make_flat_card(self, parent, width, height, radius=T.RADIUS_CARD, outline=MAIN_BORDER):
         """A rounded-corner dark card (real tk.Frame has square corners
         only), drawn as a polygon on a Canvas. `width`/`height` are just the
         initial/minimum size - cards are gridded/packed to stretch, and the
@@ -1234,7 +1264,7 @@ class VolgasApp:
             pad = max(5, gw * 0.07)
             r = (gw - 2 * pad) / 2
             left, right, top, bottom = x0 + pad, x0 + gw - pad, y0 + pad, y0 + gh - pad
-            _draw_round_rect(card, left, top, right, bottom, r, fill="#0a0b10", outline=MAIN_BORDER, width=1,
+            _draw_round_rect(card, left, top, right, bottom, r, fill=T.SURFACE_WELL, outline=MAIN_BORDER, width=1,
                               tags="gauge")
             frac = max(0.0, min(1.0, state["raw"] / 1023.0))
             fill_top = bottom - frac * (bottom - top)
@@ -1288,7 +1318,7 @@ class VolgasApp:
             card.delete(tag)
             x0, x1 = bar_inset, w - bar_inset
             y0, y1 = bar_top + pad, bar_top + height - pad
-            _draw_round_rect(card, x0 + pad, y0, x1 - pad, y1, r, fill="#0a0b10", outline=MAIN_BORDER, width=1,
+            _draw_round_rect(card, x0 + pad, y0, x1 - pad, y1, r, fill=T.SURFACE_WELL, outline=MAIN_BORDER, width=1,
                               tags=tag)
             frac = max(0.0, min(1.0, (var.get() - from_) / (to - from_)))
             fill_x = x0 + pad + frac * (x1 - x0 - 2 * pad)
@@ -1332,7 +1362,7 @@ class VolgasApp:
         var.trace_add("write", redraw)
         redraw()
 
-    def _build_wheel_card(self, parent, width=600, height=480):
+    def _build_wheel_card(self, parent, width=600, height=480, wheelbase_controls=True):
         """A wheel card - the card IS the wheel canvas: the rounded
         background, the photo, the angle readout and Set Centre are all on
         one canvas. (Separate widgets for the readout once showed a faint
@@ -1347,8 +1377,12 @@ class VolgasApp:
             self._wheel_fill_rgb = (r16 // 256, g16 // 256, b16 // 256)
             self._load_wheel_image()
 
-        canvas = self._make_flat_card(parent, width, height, outline="")
+        canvas = self._make_flat_card(parent, width, height, outline="" if wheelbase_controls else MAIN_BORDER)
         state = {"size": None, "base": None, "photo": None}
+        # Without wheelbase controls (Home) the card has a title row and a
+        # footer instead of the angle readout and Set Centre.
+        header_h = 0 if wheelbase_controls else 44
+        footer_h = 0 if wheelbase_controls else 52
 
         def resize_photo(size):
             size = max(40, int(size))
@@ -1368,7 +1402,8 @@ class VolgasApp:
                                            fillcolor=self._wheel_fill_rgb)
             state["photo"] = ImageTk.PhotoImage(rotated)  # keep a reference - Tk drops GC'd images
             canvas.itemconfig(image_id, image=state["photo"])
-            canvas.itemconfig(text_id, text=f"{angle_deg:+.0f}°")
+            if wheelbase_controls:
+                canvas.itemconfig(text_id, text=f"{angle_deg:+.0f}°")
 
         def apply_resize():
             w, h = canvas.winfo_width(), canvas.winfo_height()
@@ -1377,7 +1412,7 @@ class VolgasApp:
             # within the corner radius of the card's sides: the photo is an
             # opaque square, and its card-coloured corners mustn't cover the
             # card's rounded corners.
-            resize_photo(min(w - 40, h - 2 * CARD_PAD - 4))
+            resize_photo(min(w - 40, h - 2 * CARD_PAD - 4 - header_h - footer_h))
             draw(self._last_wheel_angle)
 
         # Resampling the photo costs several ms and a drag-resize sends dozens
@@ -1391,14 +1426,33 @@ class VolgasApp:
                 return
             # Nudged down from dead-center so the photo's own top edge doesn't
             # sit under the angle text above it.
-            canvas.coords(image_id, w / 2, h / 2 + WHEEL_VERTICAL_OFFSET)
-            canvas.coords(text_id, w / 2, CARD_PAD + 20)
-            canvas.coords(centre_id, w / 2, WHEEL_CENTRE_BUTTON_Y)
+            if wheelbase_controls:
+                canvas.coords(image_id, w / 2, h / 2 + WHEEL_VERTICAL_OFFSET)
+                canvas.coords(text_id, w / 2, CARD_PAD + 20)
+                canvas.coords(centre_id, w / 2, WHEEL_CENTRE_BUTTON_Y)
+            else:
+                canvas.coords(image_id, w / 2, (header_h + h - footer_h) / 2)
+                canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + 12)
+                canvas.coords(divider_id, T.SPACE_4, h - footer_h, w - T.SPACE_4, h - footer_h)
+                canvas.coords(foot_left_id, T.SPACE_4, h - footer_h / 2)
             resize_soon()
 
         resize_photo(MAIN_WHEEL_CANVAS_SIZE)
         state["photo"] = ImageTk.PhotoImage(state["base"])
         image_id = canvas.create_image(0, 0, image=state["photo"])
+        if not wheelbase_controls:
+            canvas.create_text(T.SPACE_4, T.SPACE_4 + 12, text="Steering wheel", font=T.FONT_TITLE,
+                               fill=T.TEXT_PRIMARY, anchor="w")
+            # The dash relays the wheel's buttons to Windows but doesn't
+            # report the radio link to the PC yet, so say so honestly.
+            pill = ui.StatusPill(canvas, "idle", "Link not reported", bg=MAIN_PANEL)
+            pill_id = canvas.create_window(0, 0, window=pill, anchor="e")
+            divider_id = canvas.create_line(0, 0, 0, 0, fill=MAIN_BORDER)
+            foot_left_id = canvas.create_text(0, 0, anchor="w", font=T.FONT_CAPTION, fill=T.TEXT_SECONDARY,
+                                              text="12 buttons  \u00b7  wireless, through the dash")
+            canvas.bind("<Configure>", on_resize, add="+")
+            self._wheel_cards.append((canvas, draw))
+            return canvas
         text_id = canvas.create_text(0, CARD_PAD + 20, text="0°", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
         # Set Centre sits right under the angle readout it zeroes. Card
         # background colour (MAIN_BORDER on MAIN_PANEL) so it stays visible on
@@ -1413,7 +1467,8 @@ class VolgasApp:
         return canvas
 
     def _redraw_forces_toggle(self):
-        _draw_toggle(self.main_forces_toggle, self.main_forces_enabled_var.get())
+        if hasattr(self, "main_forces_toggle"):
+            _draw_toggle(self.main_forces_toggle, self.main_forces_enabled_var.get())
 
     def _on_forces_enabled_toggle(self, _event=None):
         self.main_forces_enabled_var.set(not self.main_forces_enabled_var.get())
@@ -1527,14 +1582,14 @@ class VolgasApp:
         # compact horizontal cut of it (_add_card_mini_bar) so the curve
         # cards below still have room without the tab needing to scroll.
         bars_card = self._make_flat_card(root, 900, 56)
-        bars_card.pack(fill="x", padx=12, pady=(0, 10))
+        bars_card.pack(fill="x", padx=12, pady=(T.SPACE_3, 10))
         self.pedal_throttle_update = self._add_card_mini_bar(bars_card, 0, "THROTTLE", MAIN_GREEN)
         self.pedal_brake_update = self._add_card_mini_bar(bars_card, 1, "BRAKE", MAIN_RED)
 
         # Per-pedal response curve editors, side by side. Tighter outer/inter-card
         # padding than the rest of the tab so the plots themselves get the space.
         curves_row = tk.Frame(root, bg=MAIN_BG)
-        curves_row.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        curves_row.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         curves_row.columnconfigure(0, weight=1)
         curves_row.columnconfigure(1, weight=1)
         curves_row.rowconfigure(0, weight=1)
@@ -1550,7 +1605,8 @@ class VolgasApp:
         # calibration by hand, which the wizard replaced.
         act = tk.Frame(root, bg=MAIN_BG)
         act.pack(fill="x", padx=12, pady=(0, 12))
-        self.status_label = tk.Label(act, text="", font=("Segoe UI", 9), fg=MAIN_TEXT_DIM, bg=MAIN_BG)
+        self.status_label = tk.Label(act, text="Waiting for the pedals", font=T.FONT_CAPTION, fg=MAIN_TEXT_DIM,
+                                     bg=MAIN_BG)
         self.status_label.pack(side="left", padx=8)
 
     def _add_card_mini_bar(self, card, column, label, color):
@@ -1590,7 +1646,7 @@ class VolgasApp:
             bx1, by1 = row_x + row_w - value_w - 8, by0 + height
             if bx1 - bx0 <= 2 * pad:
                 return
-            _draw_round_rect(card, bx0 + pad, by0 + pad, bx1 - pad, by1 - pad, r, fill="#0a0b10", outline=MAIN_BORDER,
+            _draw_round_rect(card, bx0 + pad, by0 + pad, bx1 - pad, by1 - pad, r, fill=T.SURFACE_WELL, outline=MAIN_BORDER,
                               width=1, tags=tag)
             frac = max(0.0, min(1.0, state["raw"] / 1023.0))
             fill_x = bx0 + pad + frac * (bx1 - bx0 - 2 * pad)
@@ -1630,9 +1686,8 @@ class VolgasApp:
         title_font = ("Segoe UI", 11, "bold")
         card.create_text(CARD_PAD + 3, CARD_PAD + 2 + _label_height(title_font) / 2, text=title, font=title_font,
                          fill=MAIN_TEXT, anchor="w")
-        calibrate = tk.Button(card, text="Calibrate", font=("Segoe UI", 9, "bold"), fg=MAIN_BG, bg=MAIN_CYAN,
-                              activebackground=MAIN_CYAN, activeforeground=MAIN_BG, relief="flat", padx=12, pady=3,
-                              bd=0, cursor="hand2", command=lambda k=pedal_key: self._open_calibrate_wizard(k))
+        calibrate = ui.FlatButton(card, "Calibrate", variant="primary", font=T.FONT_CAPTION, padx=12, pady=3,
+                                  command=lambda k=pedal_key: self._open_calibrate_wizard(k))
         calibrate_id = card.create_window(0, CARD_PAD + 2, window=calibrate, anchor="ne")
 
         # Curve is edited by dragging its 5 points directly on the plot
@@ -1645,7 +1700,7 @@ class VolgasApp:
         # weighted row, so making the window taller enlarges the plot instead
         # of leaving dead space under it - a bigger plot for the same tab
         # footprint, not a taller tab.
-        canvas = tk.Canvas(card, height=220, bg="#0a0b10", highlightthickness=1, highlightbackground=MAIN_BORDER,
+        canvas = tk.Canvas(card, height=220, bg=T.SURFACE_WELL, highlightthickness=1, highlightbackground=MAIN_BORDER,
                            cursor="hand2")
         plot_top = CARD_PAD + 34
         plot_id = card.create_window(CARD_PAD + 2, plot_top, window=canvas, anchor="nw")
@@ -1673,10 +1728,9 @@ class VolgasApp:
             ("Rev. Exponential", CURVE_PRESET_REVERSE_EXPONENTIAL),
         )
         for label, values in presets:
-            tk.Button(preset_row, text=label, font=("Segoe UI", 8), fg=MAIN_TEXT, bg=MAIN_BORDER,
-                      activebackground=color, activeforeground=MAIN_BG, relief="flat", padx=8, pady=4,
-                      bd=0, cursor="hand2",
-                      command=lambda k=pedal_key, v=values: self._apply_curve_preset(k, v)).pack(side="left", padx=3)
+            ui.FlatButton(preset_row, label, font=T.FONT_CAPTION, padx=10, pady=4,
+                          command=lambda k=pedal_key, v=values: self._apply_curve_preset(k, v)).pack(side="left",
+                                                                                                    padx=3)
         preset_id = card.create_window(0, 0, window=preset_row, anchor="n")
 
         def layout(event):
@@ -1692,18 +1746,29 @@ class VolgasApp:
         self._redraw_pedal_curve(pedal_key)
         return card
 
+    # Plot margins: room for the point labels above the top row and for the
+    # input-axis labels under the bottom row, so nothing is clipped.
+    CURVE_PAD_X = 20
+    CURVE_PAD_TOP = 22
+    CURVE_PAD_BOTTOM = 26
+
     def _curve_plot_geometry(self, canvas, n):
-        """Shared pad/point-x-position math between drawing and hit-testing,
-        so a drag always grabs exactly the point it looks like it's over."""
+        """Shared margin/point-position math between drawing and hit-testing,
+        so a drag always grabs exactly the point it looks like it's over.
+        Returns (w, h, (left, top, right, bottom), xs)."""
         w, h = canvas.winfo_width(), canvas.winfo_height()
-        pad = 14
-        xs = [pad + (w - 2 * pad) * (i / (n - 1)) for i in range(n)] if w > 1 else None
-        return w, h, pad, xs
+        box = (self.CURVE_PAD_X, self.CURVE_PAD_TOP, w - self.CURVE_PAD_X, h - self.CURVE_PAD_BOTTOM)
+        xs = [box[0] + (box[2] - box[0]) * (i / (n - 1)) for i in range(n)] if w > 1 else None
+        return w, h, box, xs
+
+    def _curve_widgets(self, pedal_key):
+        if pedal_key == "throttle":
+            return self.throttle_curve_canvas, self.throttle_curve_vars, MAIN_GREEN
+        return self.brake_curve_canvas, self.brake_curve_vars, MAIN_RED
 
     def _curve_mouse_down(self, event, pedal_key):
-        canvas = self.throttle_curve_canvas if pedal_key == "throttle" else self.brake_curve_canvas
-        curve_vars = self.throttle_curve_vars if pedal_key == "throttle" else self.brake_curve_vars
-        _w, _h, _pad, xs = self._curve_plot_geometry(canvas, len(curve_vars))
+        canvas, curve_vars, _color = self._curve_widgets(pedal_key)
+        _w, _h, _box, xs = self._curve_plot_geometry(canvas, len(curve_vars))
         if not xs:
             return
         nearest_i = min(range(len(xs)), key=lambda i: abs(xs[i] - event.x))
@@ -1715,10 +1780,9 @@ class VolgasApp:
         if self._curve_drag is None or self._curve_drag[0] != pedal_key:
             return
         _, i = self._curve_drag
-        canvas = self.throttle_curve_canvas if pedal_key == "throttle" else self.brake_curve_canvas
-        curve_vars = self.throttle_curve_vars if pedal_key == "throttle" else self.brake_curve_vars
-        _w, h, pad, _xs = self._curve_plot_geometry(canvas, len(curve_vars))
-        frac = 1.0 - (event.y - pad) / (h - 2 * pad)
+        canvas, curve_vars, _color = self._curve_widgets(pedal_key)
+        _w, _h, (_left, top, _right, bottom), _xs = self._curve_plot_geometry(canvas, len(curve_vars))
+        frac = 1.0 - (event.y - top) / max(1, bottom - top)
         curve_vars[i].set(max(0, min(100, round(frac * 100))))
         self._redraw_pedal_curve(pedal_key)
 
@@ -1734,48 +1798,91 @@ class VolgasApp:
         self._redraw_pedal_curve(pedal_key)
         self._send_calibration()
 
+    @staticmethod
+    def _curve_output(curve, frac):
+        """Output fraction for an input fraction, the same piecewise-linear
+        interpolation through 5 points as the firmware's applyCurve()."""
+        pos = max(0.0, min(1.0, frac)) * (len(curve) - 1)
+        i = min(int(pos), len(curve) - 2)
+        t = pos - i
+        return (curve[i] + (curve[i + 1] - curve[i]) * t) / 100.0
+
     def _redraw_pedal_curve(self, pedal_key):
-        if pedal_key == "throttle":
-            canvas, curve_vars, color = self.throttle_curve_canvas, self.throttle_curve_vars, MAIN_GREEN
-        else:
-            canvas, curve_vars, color = self.brake_curve_canvas, self.brake_curve_vars, MAIN_RED
+        canvas, curve_vars, color = self._curve_widgets(pedal_key)
         n = len(curve_vars)
-        w, h, pad, xs = self._curve_plot_geometry(canvas, n)
+        w, h, (left, top, right, bottom), xs = self._curve_plot_geometry(canvas, n)
         if w <= 1 or h <= 1:
             return
         canvas.delete("all")
-        canvas.create_line(pad, h - pad, w - pad, pad, fill=MAIN_BORDER, dash=(3, 2))  # linear reference
+        canvas.create_line(left, bottom, right, top, fill=MAIN_BORDER, dash=(3, 2))  # linear reference
         for frac in (0.25, 0.5, 0.75):  # faint gridlines - helps eyeball where a drag will land
-            y = (h - pad) - (h - 2 * pad) * frac
-            canvas.create_line(pad, y, w - pad, y, fill=MAIN_BORDER, dash=(1, 3))
+            y = bottom - (bottom - top) * frac
+            canvas.create_line(left, y, right, y, fill=MAIN_BORDER, dash=(1, 3))
+        canvas.create_line(left, bottom, right, bottom, fill=MAIN_BORDER)
         pts = []
         for i, var in enumerate(curve_vars):
-            y = (h - pad) - (h - 2 * pad) * (var.get() / 100.0)
+            y = bottom - (bottom - top) * (var.get() / 100.0)
             pts += [xs[i], y]
         canvas.create_line(*pts, fill=color, width=2)
         for i in range(0, len(pts), 2):
-            canvas.create_oval(pts[i] - 6, pts[i + 1] - 6, pts[i] + 6, pts[i + 1] + 6,
-                               fill=color, outline=MAIN_TEXT, width=1)
-            above = pts[i + 1] > pad + 10
-            canvas.create_text(pts[i], pts[i + 1] + (12 if above else -12),
-                               text=f"{curve_vars[i // 2].get()}%", fill=MAIN_TEXT_DIM, font=("Segoe UI", 8))
+            x, y = pts[i], pts[i + 1]
+            canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill=color, outline=MAIN_TEXT, width=1)
+            # Label above the point, unless that would leave the plot.
+            label_y = y - 14 if y - 14 >= 8 else y + 14
+            anchor = "center"
+            if i == 0:
+                anchor, x = "w", x + 9
+            elif i == len(pts) - 2:
+                anchor, x = "e", x - 9
+            canvas.create_text(x, label_y, text=f"{curve_vars[i // 2].get()}%", fill=MAIN_TEXT,
+                               font=T.FONT_CAPTION, anchor=anchor)
         for i, pct_label in enumerate(("0%", "25%", "50%", "75%", "100%")):
-            canvas.create_text(xs[i], h - 4, text=pct_label, fill=MAIN_TEXT_DIM, font=("Segoe UI", 7), anchor="s")
+            anchor = "sw" if i == 0 else "se" if i == 4 else "s"
+            x = xs[i] - 4 if i == 0 else xs[i] + 4 if i == 4 else xs[i]
+            canvas.create_text(x, h - 5, text=pct_label, fill=MAIN_TEXT_DIM, font=T.FONT_CAPTION, anchor=anchor)
+        self._draw_curve_live_marker(pedal_key)
+
+    def _draw_curve_live_marker(self, pedal_key):
+        """A ring on the curve where the pedal is right now, so the effect of
+        the curve can be seen while pressing the pedal."""
+        if not hasattr(self, "throttle_curve_canvas"):
+            return
+        canvas, curve_vars, color = self._curve_widgets(pedal_key)
+        canvas.delete("live")
+        frac = self._pedal_live.get(pedal_key)
+        if frac is None or not canvas.winfo_viewable():
+            return
+        w, h, (left, top, right, bottom), _xs = self._curve_plot_geometry(canvas, len(curve_vars))
+        if w <= 1:
+            return
+        out = self._curve_output([v.get() for v in curve_vars], frac)
+        x = left + (right - left) * frac
+        y = bottom - (bottom - top) * out
+        canvas.create_line(x, bottom, x, y, fill=T.ACCENT, dash=(2, 3), tags="live")
+        canvas.create_oval(x - 8, y - 8, x + 8, y + 8, outline=T.ACCENT, width=2, tags="live")
 
     def _open_calibrate_wizard(self, pedal_key):
-        """Guided 2-step calibration for one pedal at a time: rest, then
-        pressed fully. Only touches that pedal's hallMin/hallMax or
-        loadMin/loadMax in cal_state - the other pedal's calibration (and
-        both curves) are untouched. Replaces the old manual "type in the
-        raw number" fields - the live raw values are already streaming in
-        over STATUS packets, so there's nothing for the user to read off
-        and transcribe themselves."""
-        if not self.ser:
-            messagebox.showwarning("Not connected", "Connect to the pedals first.")
+        """Guided 2-step calibration for one pedal: capture it at rest, then
+        fully pressed. Each capture averages a short window of readings
+        (taking the median, so one spike can't skew it) and the result is
+        checked before anything is sent: too little travel, or a pedal that
+        moved during a capture, is explained and nothing is written. Only
+        this pedal's endpoints change; the other pedal and both curves are
+        untouched."""
+        if not self.ser or not self.last_status:
+            self._notify("Connect the pedals first - Volgas needs live readings to calibrate.", "warn")
+            return
+        if not self._cal_loaded:
+            self._request_cal()
+            self._notify("Still reading the pedals' settings - try again in a moment.", "warn")
             return
 
-        pedal_name = "Throttle" if pedal_key == "throttle" else "Brake"
-        raw_field = "hall" if pedal_key == "throttle" else "load"
+        pedal_name = "throttle" if pedal_key == "throttle" else "brake"
+        limits = THROTTLE_LIMITS if pedal_key == "throttle" else BRAKE_LIMITS
+        capture_s = CAPTURE_SECONDS[pedal_key]
+        steps = [("rest", f"Take your foot off the {pedal_name} and let it rest."),
+                 ("full", f"Press the {pedal_name} all the way down and hold it there.")]
+        state = {"step": 0, "captures": {}, "samples": None, "deadline": None, "seen": None, "done": False}
 
         win = tk.Toplevel(self.root)
         win.title(f"Calibrate {pedal_name}")
@@ -1783,69 +1890,131 @@ class VolgasApp:
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
+        body = tk.Frame(win, bg=MAIN_PANEL)
+        body.pack(fill="both", expand=True, padx=T.SPACE_5, pady=T.SPACE_5)
 
-        steps = [
-            ("rest", f"Release the {pedal_name.upper()} pedal fully and leave it at rest."),
-            ("full", f"Press the {pedal_name.upper()} pedal all the way to the floor and hold it."),
-        ]
-        state = {"step": 0, "min": None, "max": None}
+        tk.Label(body, text=f"Calibrate {pedal_name}", font=T.FONT_HEADING, fg=T.TEXT_PRIMARY,
+                 bg=MAIN_PANEL).pack(anchor="w")
+        step_label = tk.Label(body, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
+        step_label.pack(anchor="w", pady=(T.SPACE_1, T.SPACE_4))
+        instruction = tk.Label(body, text="", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL,
+                               wraplength=380, justify="left")
+        instruction.pack(anchor="w")
+        reading = tk.Label(body, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
+        reading.pack(anchor="w", pady=(T.SPACE_3, 0))
+        progress = tk.Canvas(body, width=380, height=6, bg=MAIN_PANEL, highlightthickness=0)
+        progress.pack(anchor="w", pady=(T.SPACE_2, 0))
+        ui.draw_round_rect(progress, 0, 0, 380, 6, 3, fill=T.SURFACE_RAISED, outline="")
+        progress_fill = ui.draw_round_rect(progress, 0, 0, 0, 6, 3, fill=T.ACCENT, outline="", state="hidden")
+        message = tk.Label(body, text="", font=T.FONT_BODY, fg=T.STATUS_ERROR, bg=MAIN_PANEL, wraplength=380,
+                           justify="left")
+        message.pack(anchor="w", pady=(T.SPACE_3, 0))
 
-        label = tk.Label(win, text=steps[0][1], font=("Segoe UI", 12), fg=MAIN_TEXT, bg=MAIN_PANEL,
-                          wraplength=320, justify="center")
-        label.pack(padx=24, pady=(24, 8))
-        reading_label = tk.Label(win, text="", font=("Segoe UI", 10), fg=MAIN_TEXT_DIM, bg=MAIN_PANEL)
-        reading_label.pack(pady=(0, 16))
-        btn_row = tk.Frame(win, bg=MAIN_PANEL)
-        btn_row.pack(pady=(0, 20))
+        buttons = tk.Frame(body, bg=MAIN_PANEL)
+        buttons.pack(fill="x", pady=(T.SPACE_4, 0))
+        primary = ui.FlatButton(buttons, "Capture", variant="primary", font=T.FONT_LABEL, padx=18, pady=6)
+        primary.pack(side="right")
+        cancel = ui.FlatButton(buttons, "Cancel", command=win.destroy, padx=18, pady=6)
+        cancel.pack(side="right", padx=(0, T.SPACE_2))
 
         def current_reading():
             if not self.last_status:
                 return None
-            hall_raw, hall_f, load_raw, _throttle, _brake = self.last_status
+            _hall_raw, hall_f, load_raw, _throttle, _brake = self.last_status
             return hall_f if pedal_key == "throttle" else load_raw
 
-        def refresh_reading():
+        def show_step():
+            key, text = steps[state["step"]]
+            step_label.config(text=f"Step {state['step'] + 1} of {len(steps)}")
+            instruction.config(text=text + f" Then choose Capture and keep still for {capture_s:g} seconds.")
+            primary.set_text("Capture")
+            primary.set_command(start_capture)
+            primary.set_enabled(True)
+
+        def start_capture():
+            message.config(text="")
+            state["samples"] = []
+            state["seen"] = None
+            state["deadline"] = time.monotonic() + capture_s
+            primary.set_enabled(False)
+            primary.set_text("Hold still...")
+            progress.itemconfig(progress_fill, state="normal")
+
+        def finish_capture():
+            key = steps[state["step"]][0]
+            try:
+                cap = summarise(state["samples"])
+            except ValueError:
+                message.config(text="No readings arrived during the capture. Check that the pedals are "
+                                    "connected and try again.")
+                show_step()
+                return
+            state["captures"][key] = cap
+            state["step"] += 1
+            if state["step"] < len(steps):
+                show_step()
+                return
+            error = check_calibration(state["captures"]["rest"], state["captures"]["full"], limits)
+            if error:
+                log.info("calibration rejected (%s): %s", pedal_key, error)
+                message.config(text=error, fg=T.STATUS_ERROR)
+                state["step"], state["captures"] = 0, {}
+                show_step()
+                primary.set_text("Start again")
+                return
+            rest, full = state["captures"]["rest"], state["captures"]["full"]
+            step_label.config(text="Ready to save")
+            instruction.config(text=f"Rest {rest.value}, fully pressed {full.value} "
+                                    f"({abs(full.value - rest.value)} {limits.unit} of travel). "
+                                    "Save this calibration to the pedals?")
+            message.config(text="")
+            primary.set_text("Save")
+            primary.set_command(save)
+            primary.set_enabled(True)
+
+        def save():
+            rest, full = state["captures"]["rest"], state["captures"]["full"]
+            keys = ("hallMin", "hallMax") if pedal_key == "throttle" else ("loadMin", "loadMax")
+            previous = {k: self.cal_state[k] for k in keys}
+            self.cal_state[keys[0]], self.cal_state[keys[1]] = rest.value, full.value
+            if self._send_calibration():  # applies AND saves to flash - see _send_calibration
+                log.info("calibrated %s: rest=%s full=%s", pedal_key, rest.value, full.value)
+                state["done"] = True
+                win.destroy()
+            else:
+                self.cal_state.update(previous)
+                message.config(text="Couldn't send the calibration to the pedals. Nothing was changed.")
+
+        def tick():
             if not win.winfo_exists():
+                return
+            if self.ser is None:
+                message.config(text="The pedals were disconnected. Close this window and try again once "
+                                    "they're back.")
+                primary.set_enabled(False)
                 return
             v = current_reading()
             if v is not None:
-                reading_label.config(text=f"live: {raw_field}={v}")
-            win.after(100, refresh_reading)
+                reading.config(text=f"Sensor reading: {v}")
+            if state["deadline"] is not None:
+                stamp = getattr(self, "last_status_time", None)
+                if v is not None and stamp != state["seen"]:
+                    state["seen"] = stamp
+                    state["samples"].append(v)
+                remaining = state["deadline"] - time.monotonic()
+                frac = 1.0 - max(0.0, remaining) / capture_s
+                progress.coords(progress_fill, *ui.round_rect_points(0, 0, max(6, 380 * frac), 6, 3))
+                if remaining <= 0:
+                    state["deadline"] = None
+                    progress.itemconfig(progress_fill, state="hidden")
+                    finish_capture()
+            win.after(15, tick)
 
-        def do_next():
-            v = current_reading()
-            if v is None:
-                messagebox.showwarning("No data", "No live data yet.", parent=win)
-                return
-            step_key = steps[state["step"]][0]
-            if step_key == "rest":
-                state["min"] = v
-            else:
-                state["max"] = v
-
-            state["step"] += 1
-            if state["step"] < len(steps):
-                label.config(text=steps[state["step"]][1])
-                next_btn.config(text="Finish")
-            else:
-                if pedal_key == "throttle":
-                    self.cal_state["hallMin"] = state["min"]
-                    self.cal_state["hallMax"] = state["max"]
-                else:
-                    self.cal_state["loadMin"] = state["min"]
-                    self.cal_state["loadMax"] = state["max"]
-                self._send_calibration()  # applies AND saves to flash - see _send_calibration
-                win.destroy()
-
-        next_btn = tk.Button(btn_row, text="Next", font=("Segoe UI", 10, "bold"), fg=MAIN_BG, bg=MAIN_CYAN,
-                              activebackground=MAIN_CYAN, activeforeground=MAIN_BG, relief="flat", padx=20,
-                              pady=6, bd=0, cursor="hand2", command=do_next)
-        next_btn.pack(side="left", padx=6)
-        tk.Button(btn_row, text="Cancel", font=("Segoe UI", 10), fg=MAIN_TEXT, bg=MAIN_BORDER,
-                  activebackground=MAIN_BORDER, activeforeground=MAIN_TEXT, relief="flat", padx=20, pady=6,
-                  bd=0, cursor="hand2", command=win.destroy).pack(side="left", padx=6)
-
-        refresh_reading()
+        win.bind("<Return>", lambda _e: primary.invoke())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        show_step()
+        tick()
+        primary.focus_set()
 
     def _build_wheelbase_tab(self, parent):
         # Same look as the Main tab: flat buttons on the dark background, then
@@ -1946,7 +2115,7 @@ class VolgasApp:
         return ("standby", bridge.time_synced, True, (t.tm_wday, t.tm_hour, t.tm_min))
 
     def _dash_preview_poll(self):
-        if self._tab_frames["Dashboard"].winfo_ismapped():
+        if self._tab_frames["Dash"].winfo_ismapped():
             state = self._dash_preview_state()
             if state != self._dash_shown_state:
                 self._dash_shown_state = state
@@ -1991,12 +2160,11 @@ class VolgasApp:
         self._update_status_id = card.create_text(x0, status_mid, text="Not checked yet", font=("Segoe UI", 10),
                                                   fill=MAIN_TEXT, anchor="w")
 
-        button_style = dict(font=("Segoe UI", 9), fg=MAIN_TEXT, bg=MAIN_BORDER, activebackground=MAIN_CYAN,
-                            activeforeground=MAIN_BG, relief="flat", padx=12, pady=4, bd=0, cursor="hand2")
         buttons = tk.Frame(card, bg=MAIN_PANEL)
-        tk.Button(buttons, text="Check for updates", command=self._start_update_check, **button_style).pack(side="left")
-        self._update_install_btn = tk.Button(buttons, text="Update", command=self._start_update_install,
-                                             **button_style)
+        ui.FlatButton(buttons, "Check for updates", command=self._start_update_check,
+                      font=T.FONT_CAPTION).pack(side="left")
+        self._update_install_btn = ui.FlatButton(buttons, "Update", command=self._start_update_install,
+                                                 variant="primary", font=T.FONT_CAPTION)
         card.create_window(x0, WB_ROWS_TOP + 3 * WB_ROW_H + WB_ROW_H / 2, window=buttons, anchor="w")
 
         notes_top = WB_ROWS_TOP + 4 * WB_ROW_H
@@ -2008,6 +2176,51 @@ class VolgasApp:
             self._update_notes_id, width=max(50, e.width - x0 - CARD_PAD - 8)), add="+")
         self._settings_card = card
         self._fit_settings_card()
+        self._build_support_card(parent)
+
+    def _build_support_card(self, parent):
+        """Where Volgas keeps its files, a shortcut to the log for bug
+        reports, and the experimental Wheelbase page switch."""
+        card, inner = self._make_frame_card(parent, 520, 190)
+        card.pack(padx=20, pady=(0, 20))
+        tk.Label(inner, text="Support", font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(anchor="w")
+        tk.Label(inner, text="Settings and logs are kept in:", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
+                 bg=MAIN_PANEL).pack(anchor="w", pady=(T.SPACE_2, 0))
+        tk.Label(inner, text=data_dir(), font=T.FONT_CAPTION, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL, wraplength=460,
+                 justify="left").pack(anchor="w")
+        row = tk.Frame(inner, bg=MAIN_PANEL)
+        row.pack(anchor="w", pady=(T.SPACE_3, 0))
+        ui.FlatButton(row, "Open log folder", command=lambda: self._open_folder(log_dir()),
+                      font=T.FONT_CAPTION).pack(side="left")
+        show = {"value": self._show_wheelbase}
+        toggle = ui.FlatButton(row, "", font=T.FONT_CAPTION)
+
+        def refresh():
+            toggle.set_text("Wheelbase page: " + ("shown" if show["value"] else "hidden"))
+
+        def flip():
+            show["value"] = not show["value"]
+            self._wb_settings["show_wheelbase"] = show["value"]
+            _save_settings(self._wb_settings)
+            refresh()
+            self._notify("The Wheelbase page change takes effect the next time Volgas starts.", "info")
+
+        toggle.set_command(flip)
+        toggle.pack(side="left", padx=(T.SPACE_2, 0))
+        refresh()
+
+    def _open_folder(self, path):
+        try:
+            os.makedirs(path, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606 - opening a folder the app owns
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as e:
+            log.warning("could not open %s", path, exc_info=True)
+            self._notify(f"Couldn't open the folder ({e}). It's at {path}", "warn")
 
     def _fit_settings_card(self):
         """Height = what's showing plus the same gap below the last line as
@@ -2193,7 +2406,7 @@ class VolgasApp:
             x0, x1 = bar_x()
             if x1 - x0 <= 2 * pad + 2 * r:
                 return
-            _draw_round_rect(card, x0 + pad, y0, x1 - pad, y1, r, fill="#0a0b10", outline=MAIN_BORDER, width=1,
+            _draw_round_rect(card, x0 + pad, y0, x1 - pad, y1, r, fill=T.SURFACE_WELL, outline=MAIN_BORDER, width=1,
                               tags=tag)
             fill_x = x0 + pad + max(0.0, min(1.0, frac_of(value))) * (x1 - x0 - 2 * pad)
             if fill_x > x0 + pad + r:
@@ -2292,57 +2505,87 @@ class VolgasApp:
     # ---------- serial ----------
 
     def _connect_to(self, port):
+        """Open the pedals and start a reader that belongs to this connection
+        only. Each connection gets its own stop event and its own parser, so
+        an unplug/replug can never leave two readers on one port or let an
+        old reader pick up the new port."""
         try:
-            self.ser = serial.Serial(port, 115200, timeout=0.05)
+            ser = serial.Serial(port, 115200, timeout=0.05)
         except serial.SerialException:
-            self.ser = None  # auto-scan retries silently every second, nothing to report here
-            return
-        self.reader = threading.Thread(target=self._read_loop, daemon=True)
-        self.reader.start()
+            return  # auto-scan retries silently every second
+        stop = threading.Event()
+        parser = FrameParser(lambda t, p, s=stop: None if s.is_set() else self.rx_queue.put((t, p)))
+        reader = threading.Thread(target=self._read_loop, args=(ser, parser, stop), name="pedal-reader",
+                                  daemon=True)
+        self.ser, self._pedal_stop, self.reader = ser, stop, reader
+        self._cal_loaded = False
+        self.last_status = None
+        log.info("pedals connected on %s", port)
+        reader.start()
         self._request_cal()
 
-    def _disconnect(self):
+    def _disconnect(self, reason=None):
         ser, self.ser = self.ser, None
+        stop, self._pedal_stop = getattr(self, "_pedal_stop", None), None
+        reader, self.reader = self.reader, None
+        if stop:
+            stop.set()
         if ser:
             try:
                 ser.close()
-            except serial.SerialException:
-                pass
+            except (serial.SerialException, OSError):
+                log.warning("error closing the pedal port", exc_info=True)
+        if reader and reader is not threading.current_thread():
+            reader.join(timeout=0.5)
+        if ser:
+            log.info("pedals disconnected%s", f" ({reason})" if reason else "")
+        self._cal_loaded = False
+        self.last_status = None
+        if hasattr(self, "main_throttle_update"):
+            self.main_throttle_update(None)
+            self.main_brake_update(None)
 
     def _auto_scan(self):
+        if self._closing:
+            return
         if not self.ser:
             port = find_pedal_port()
             if port:
                 self._connect_to(port)
         self.root.after(1000, self._auto_scan)
 
-    def _read_loop(self):
-        while self.ser:
+    def _read_loop(self, ser, parser, stop):
+        """Runs on its own thread for one connection. Only touches its own
+        port and parser; reports a lost link through the queue."""
+        while not stop.is_set():
             try:
-                data = self.ser.read(64)
-            except (serial.SerialException, TypeError, AttributeError):
-                self.rx_queue.put(("lost", b""))
+                data = ser.read(64)
+            except (serial.SerialException, OSError, TypeError, AttributeError) as e:
+                if not stop.is_set():
+                    self.rx_queue.put(("lost", (stop, str(e))))
                 return
             if data:
-                self.parser.feed(data)
+                parser.feed(data)
 
-    def _send(self, frame):
+    def _send(self, frame, quiet=False):
         if not self.ser:
-            messagebox.showwarning("Not connected", "Connect to the device first.")
+            if not quiet:
+                self._notify("The pedals aren't connected. Plug them in and Volgas will find them.", "warn")
             return False
         try:
             self.ser.write(frame)
             return True
-        except serial.SerialException as e:
-            messagebox.showerror("Write failed", str(e))
-            self._disconnect()
+        except (serial.SerialException, OSError) as e:
+            log.warning("pedal write failed", exc_info=True)
+            self._notify(f"Couldn't send to the pedals ({e}). Reconnecting...", "error")
+            self._disconnect("write failed")
             return False
 
     # ---------- commands ----------
 
     def _request_cal(self):
         if self.ser:
-            self._send(build_frame(MSG_GET_CALIBRATION))
+            self._send(build_frame(MSG_GET_CALIBRATION), quiet=True)
 
     def _send_calibration(self):
         """Push the complete CalibrationData struct - hallMin/Max +
@@ -2356,7 +2599,15 @@ class VolgasApp:
         real concern - this only fires on deliberate user edits, nowhere
         near the emulated EEPROM's write-cycle budget."""
         if not self.ser:
-            return
+            self._notify("The pedals aren't connected, so the change wasn't saved.", "warn")
+            return False
+        if not self._cal_loaded:
+            # Every send carries the whole calibration, so sending before the
+            # pedals' own values have arrived would overwrite their saved
+            # calibration with Volgas's defaults. Ask again and wait instead.
+            self._request_cal()
+            self._notify("Still reading the pedals' settings - try again in a moment.", "warn")
+            return False
         payload = struct.pack(
             CAL_FMT,
             self.cal_state["hallMin"], self.cal_state["hallMax"],
@@ -2366,16 +2617,18 @@ class VolgasApp:
         )
         if self._send(build_frame(MSG_SET_CALIBRATION, payload)):
             self._save()
+            return True
+        return False
 
     def _save(self):
         if self._send(build_frame(MSG_SAVE)):
-            self.status_label.config(text="saving...", foreground=MAIN_TEXT)
+            self._set_pedal_status("Saving to the pedals...", "idle")
 
     # ---------- wheelbase (HID PID) ----------
 
     def _wb_send_command(self, cmd):
         if not self.wb_connected:
-            messagebox.showwarning("Not connected", "Wheelbase not connected.")
+            self._notify("The wheelbase isn't connected.", "warn")
             return
         self.wb_cmd_queue.put(cmd)
 
@@ -2404,27 +2657,125 @@ class VolgasApp:
             while True:
                 msg_type, payload = self.rx_queue.get_nowait()
                 if msg_type == "lost":
-                    self._disconnect()
+                    stop, reason = payload
+                    if stop is getattr(self, "_pedal_stop", None):  # ignore news from an old connection
+                        self._disconnect(reason)
+                        self._notify("Lost contact with the pedals. Volgas will reconnect when they're back.",
+                                     "warn")
                 elif msg_type == MSG_STATUS and len(payload) == STATUS_SIZE:
                     self._on_status(struct.unpack(STATUS_FMT, payload))
                 elif msg_type == MSG_CALIBRATION and len(payload) == CAL_SIZE:
                     self._on_calibration(struct.unpack(CAL_FMT, payload))
                 elif msg_type == MSG_SAVE_ACK and len(payload) == 1:
                     ok = payload[0] == 1
-                    self.status_label.config(
-                        text="saved to flash" if ok else "FLASH SAVE FAILED",
-                        foreground="green" if ok else "red")
+                    if ok:
+                        self._set_pedal_status("Saved to the pedals", "ok")
+                    else:
+                        log.error("pedal flash save failed (device reported failure)")
+                        self._set_pedal_status("The pedals couldn't save - the change is active until they "
+                                               "restart", "error")
+                        self._notify("The pedals reported that saving failed. The change is active now but "
+                                     "will be lost when they restart.", "error")
         except queue.Empty:
             pass
         self.root.after(30, self._poll)
 
     def _on_status(self, st):
         self.last_status = st  # raw hall/load fields still consumed directly by the calibrate wizard
-        _hall_raw, _hall_f, _load_raw, throttle, brake = st
+        self.last_status_time = time.monotonic()
+        _hall_raw, hall_f, load_raw, throttle, brake = st
         self.pedal_throttle_update(throttle)
         self.pedal_brake_update(brake)
         self.main_throttle_update(throttle)
         self.main_brake_update(brake)
+        if self._cal_loaded:
+            # Where each pedal sits on its curve's input axis - the same
+            # clamped mapping the firmware applies before the curve.
+            self._pedal_live["throttle"] = linear_fraction(hall_f, self.cal_state["hallMin"],
+                                                           self.cal_state["hallMax"])
+            self._pedal_live["brake"] = linear_fraction(load_raw, self.cal_state["loadMin"],
+                                                        self.cal_state["loadMax"])
+            self._draw_curve_live_marker("throttle")
+            self._draw_curve_live_marker("brake")
+
+    def _set_pedal_status(self, text, kind="idle"):
+        color = {"ok": T.STATUS_OK, "warn": T.STATUS_WARN, "error": T.STATUS_ERROR}.get(kind, T.TEXT_SECONDARY)
+        if hasattr(self, "status_label"):
+            self.status_label.config(text=text, fg=color)
+
+    # ---------- live status (title bar pills, Home cards) ----------
+
+    GAME_NAMES = {"rf2": "rFactor 2", "forza": "Forza Horizon"}
+    STATUS_POLL_MS = 250
+
+    def _status_poll(self):
+        if self._closing:
+            return
+        now = time.monotonic()
+        # Pedals
+        if self.ser is None:
+            pedal = ("idle", "Pedals not found")
+            note = "Plug in the pedals - Volgas finds them automatically"
+        elif self.last_status is None or now - getattr(self, "last_status_time", 0) > 1.0:
+            pedal = ("warn", "Pedals not responding")
+            note = "Connected, but no readings yet"
+        else:
+            pedal = ("ok", "Pedals connected")
+            note = "Calibration loaded" if self._cal_loaded else "Reading calibration..."
+        self._pedal_pill.set(*pedal)
+        self._home_pedal_pill.set(pedal[0], pedal[1].replace("Pedals ", "").capitalize())
+        self._home_pedal_note.config(text=note)
+
+        # Dash and game
+        bridge = self._dash_bridge
+        game_kind, game_text = "idle", "No game"
+        if bridge is None:
+            dash = ("error", "Dash unavailable")
+            dash_note, detail = "See the log file for details", "--"
+        elif not bridge.connected:
+            dash = ("idle", "Dash not found")
+            dash_note, detail = "Plug in the dash - Volgas finds it automatically", "--"
+        else:
+            dash = ("ok", "Dash connected")
+            dash_note = "Clock synced" if bridge.time_synced else "Syncing the clock..."
+            src = getattr(bridge, "active_source", None)
+            if src and now - src[0] < 1.5:
+                game_kind, game_text = "info", self.GAME_NAMES.get(src[1], src[1])
+                detail = "Gear, speed, RPM" + (", lap time and delta" if src[1] == "rf2" else "")
+            else:
+                detail = "Clock and date (standby)"
+        self._dash_pill.set(*dash)
+        self._game_pill.set(game_kind, game_text)
+        self._home_dash_pill.set(dash[0], dash[1].replace("Dash ", "").capitalize())
+        self._home_game_label.config(text=game_text if game_kind != "idle" else "None detected",
+                                     fg=T.TEXT_PRIMARY if game_kind != "idle" else T.TEXT_HINT)
+        self._home_dash_detail.config(text=detail)
+        self._home_dash_note.config(text=dash_note)
+        if self._tab_frames["Home"].winfo_ismapped():
+            state = self._dash_preview_state()
+            if state != self._home_dash_shown:
+                self._home_dash_shown = state
+                self._home_dash_photo = ImageTk.PhotoImage(_render_dash(state))
+                self._home_dash_image.config(image=self._home_dash_photo)
+        self.root.after(self.STATUS_POLL_MS, self._status_poll)
+
+    # ---------- shutdown ----------
+
+    def _on_close(self):
+        """Stop every background worker and close every port before the
+        window goes, so nothing is left holding a COM port or running on
+        after the app has gone."""
+        if self._closing:
+            return
+        self._closing = True
+        log.info("closing")
+        self._bridge_stop.set()
+        self._disconnect("app closing")
+        if self._bridge_thread is not None:
+            self._bridge_thread.join(timeout=2.0)
+            if self._bridge_thread.is_alive():
+                log.warning("dash bridge did not stop within 2 s")
+        self.root.destroy()
 
     def _on_calibration(self, cal):
         hall_min, hall_max, load_min, load_max, *curves = cal
@@ -2436,13 +2787,24 @@ class VolgasApp:
             var.set(v)
         for var, v in zip(self.brake_curve_vars, curves[5:]):
             var.set(v)
+        self._cal_loaded = True
         self._redraw_pedal_curve("throttle")
         self._redraw_pedal_curve("brake")
-        self.status_label.config(text="calibration read from device", foreground=MAIN_TEXT)
+        self._set_pedal_status("Calibration read from the pedals", "ok")
+
+
+def _report_callback_exception(exc_type, exc, tb):
+    """Tk swallows exceptions raised in event handlers and timers into
+    stderr, which a windowed exe doesn't have - log them instead."""
+    log.error("error in an interface callback", exc_info=(exc_type, exc, tb))
 
 
 if __name__ == "__main__":
+    log_path = setup_logging(log_dir())
+    log.info("Volgas %s starting (Python %s, %s), log: %s", VOLGAS_VERSION, sys.version.split()[0], sys.platform,
+             log_path)
     root = tk.Tk()
+    root.report_callback_exception = _report_callback_exception
     root.withdraw()
     splash = show_splash(root)
     shown_at = time.monotonic()

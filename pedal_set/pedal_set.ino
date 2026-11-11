@@ -101,14 +101,20 @@ bool loadCalibration() {
   return true;
 }
 
+// Write order matters if power is lost part-way through a save: the magic
+// marker is cleared first and written last, so a half-written save is never
+// mistaken for a valid one - loadCalibration() then falls back to the
+// compiled-in defaults instead of loading a mix of old and new values.
+// Same storage layout as before, so existing saved calibrations still load.
 bool saveCalibration() {
   uint16 words[CAL_WORDS];
   memcpy(words, &cal, sizeof(cal));
-  if (EEPROM.write(0, CAL_MAGIC) != EEPROM_OK) return false;
-  if (EEPROM.write(1, PEDAL_PROTOCOL_VERSION) != EEPROM_OK) return false;
+  if (EEPROM.write(0, 0) != EEPROM_OK) return false;  // invalidate while writing
   for (int i = 0; i < CAL_WORDS; i++) {
     if (EEPROM.write(2 + i, words[i]) != EEPROM_OK) return false;
   }
+  if (EEPROM.write(1, PEDAL_PROTOCOL_VERSION) != EEPROM_OK) return false;
+  if (EEPROM.write(0, CAL_MAGIC) != EEPROM_OK) return false;  // valid only once complete
   return true;
 }
 
@@ -210,6 +216,10 @@ void pollCommands() {
 }
 
 long constrainMap(long x, long inMin, long inMax, long outMin, long outMax) {
+  // A zero-width calibration (both ends captured at the same reading) would
+  // divide by zero in map(). Report the pedal as released instead - the
+  // same output the division happened to give, but defined behaviour.
+  if (inMin == inMax) return outMin;
   long lo = min(inMin, inMax);
   long hi = max(inMin, inMax);
   x = constrain(x, lo, hi);
