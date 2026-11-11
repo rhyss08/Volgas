@@ -95,7 +95,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.2.4"
+VOLGAS_VERSION = "0.3.0"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings

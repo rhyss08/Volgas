@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-11)
 
 Phases 0 and 1 of the improvement plan (safety net and reliability), plus the first part of the new interface.
 
