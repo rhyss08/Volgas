@@ -69,6 +69,7 @@ from PIL import Image, ImageDraw, ImageTk
 import volgas_dash_font
 import volgas_theme as T
 import volgas_ui as ui
+from volgas_theme import px
 from volgas_log import setup_logging
 from volgas_pedal_protocol import (
     MSG_STATUS, MSG_SET_CALIBRATION, MSG_SAVE, MSG_GET_CALIBRATION,
@@ -364,15 +365,17 @@ def _draw_round_rect(canvas, x1, y1, x2, y2, r, **kwargs):
 
 
 def _draw_toggle(canvas, on, x=0, y=0, tag=None):
-    """Pill on/off switch, 40x20 with its top-left at (x, y). With no tag it
-    owns the whole (40x20) canvas (Main tab's Forces switch); with a tag it
-    is drawn among other items on a card (Wheelbase tab's Integrated Spring)."""
+    """Pill on/off switch, 40x20 (at 100% display scale) with its top-left at
+    (x, y). With no tag it owns the whole canvas (Main tab's Forces switch);
+    with a tag it is drawn among other items on a card (Wheelbase tab's
+    Integrated Spring)."""
     canvas.delete(tag or "all")
     kwargs = {"tags": tag} if tag else {}
-    _draw_round_rect(canvas, x + 1, y + 1, x + 39, y + 19, 9, fill=MAIN_GREEN if on else MAIN_BORDER, outline="",
-                     **kwargs)
-    knob_x = x + (30 if on else 10)
-    canvas.create_oval(knob_x - 7, y + 3, knob_x + 7, y + 17, fill="#ffffff", outline="", **kwargs)
+    k = T.SCALE
+    _draw_round_rect(canvas, x + 1 * k, y + 1 * k, x + 39 * k, y + 19 * k, 9 * k,
+                     fill=MAIN_GREEN if on else MAIN_BORDER, outline="", **kwargs)
+    knob_x = x + (30 if on else 10) * k
+    canvas.create_oval(knob_x - 7 * k, y + 3 * k, knob_x + 7 * k, y + 17 * k, fill="#ffffff", outline="", **kwargs)
 
 
 def _mix_color(c1, c2, t):
@@ -763,7 +766,7 @@ class VolgasApp:
         style.configure("TProgressbar", background=MAIN_BLUE, troughcolor=MAIN_PANEL)
         style.configure("TNotebook", background=MAIN_BG, borderwidth=0)
         style.configure("TNotebook.Tab", background=MAIN_PANEL, foreground=MAIN_TEXT_DIM,
-                         padding=(16, 8), borderwidth=0)
+                         padding=(px(16), px(8)), borderwidth=0)
         style.map("TNotebook.Tab",
                   background=[("selected", MAIN_BG)],
                   foreground=[("selected", MAIN_TEXT)])
@@ -882,7 +885,7 @@ class VolgasApp:
         bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         bar.pack_propagate(False)
 
-        logo_size = 24
+        logo_size = px(24)
         logo_im = Image.open(asset_path("volgas_logo.png")).convert("RGBA").resize((logo_size, logo_size), Image.LANCZOS)
         self._logo_photo = ImageTk.PhotoImage(logo_im)
         logo = tk.Label(bar, image=self._logo_photo, bg=T.SURFACE_RAIL)
@@ -1099,7 +1102,7 @@ class VolgasApp:
         self.main_force_strength_var = tk.DoubleVar(value=self._wb_remembered.get("PowerLimit", 15))
         self.main_motion_range_var = tk.DoubleVar(value=self._wb_remembered.get("MotionRange", 360))
 
-        wheel_card = self._build_wheel_card(root, width=470, height=470, wheelbase_controls=False)
+        wheel_card = self._build_wheel_card(root, width=470, height=470, wheelbase_controls=False)  # 100% sizes
         wheel_card.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, T.SPACE_3))
 
         pedals_card = self._build_home_pedals_card(root)
@@ -1110,8 +1113,9 @@ class VolgasApp:
 
     def _make_frame_card(self, parent, width, height):
         """A rounded card holding an ordinary Frame, for content laid out with
-        regular widgets. Returns (card, inner_frame)."""
-        card = self._make_flat_card(parent, width, height)
+        regular widgets. width/height are 100%-display sizes. Returns
+        (card, inner_frame)."""
+        card = self._make_flat_card(parent, px(width), px(height))
         inner = tk.Frame(card, bg=MAIN_PANEL)
         win = card.create_window(T.SPACE_4, T.SPACE_4, window=inner, anchor="nw")
         card.bind("<Configure>", lambda e: card.itemconfig(
@@ -1142,23 +1146,24 @@ class VolgasApp:
             tk.Label(box, text=name, font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL).pack(anchor="w")
             value = tk.Label(box, text="--", font=T.FONT_DISPLAY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL)
             value.pack(anchor="w")
-            bar = tk.Canvas(box, height=10, bg=MAIN_PANEL, highlightthickness=0)
+            bar_h = px(10)
+            bar = tk.Canvas(box, height=bar_h, bg=MAIN_PANEL, highlightthickness=0)
             bar.pack(fill="x", pady=(T.SPACE_1, 0))
-            track = ui.draw_round_rect(bar, 0, 0, 10, 10, 5, fill=T.SURFACE_RAISED, outline="")
-            fill = ui.draw_round_rect(bar, 0, 0, 0, 10, 5, fill=color, outline="")
+            track = ui.draw_round_rect(bar, 0, 0, bar_h, bar_h, bar_h / 2, fill=T.SURFACE_RAISED, outline="")
+            fill = ui.draw_round_rect(bar, 0, 0, 0, bar_h, bar_h / 2, fill=color, outline="")
             state = {"raw": None, "shown": None}
 
             def redraw(_e=None):
                 w = bar.winfo_width()
                 if w <= 1:
                     return
-                bar.coords(track, *ui.round_rect_points(0, 0, w, 10, 5))
+                bar.coords(track, *ui.round_rect_points(0, 0, w, bar_h, bar_h / 2))
                 frac = 0.0 if state["raw"] is None else max(0.0, min(1.0, state["raw"] / AXIS_MAX))
                 if frac <= 0.01:
                     bar.itemconfig(fill, state="hidden")
                 else:
                     bar.itemconfig(fill, state="normal")
-                    bar.coords(fill, *ui.round_rect_points(0, 0, max(10, w * frac), 10, 5))
+                    bar.coords(fill, *ui.round_rect_points(0, 0, max(bar_h, w * frac), bar_h, bar_h / 2))
 
             def update(raw):
                 state["raw"] = raw
@@ -1203,7 +1208,7 @@ class VolgasApp:
         tk.Label(info, text="Showing", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
                  bg=MAIN_PANEL).pack(anchor="w", pady=(T.SPACE_2, 0))
         self._home_dash_detail = tk.Label(info, text="--", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL,
-                                          justify="left", wraplength=210)
+                                          justify="left", wraplength=px(210))
         self._home_dash_detail.pack(anchor="w")
 
         footer = tk.Frame(inner, bg=MAIN_PANEL)
@@ -1214,7 +1219,7 @@ class VolgasApp:
                       font=T.FONT_CAPTION).pack(side="right")
         return card
 
-    def _make_flat_card(self, parent, width, height, radius=T.RADIUS_CARD, outline=MAIN_BORDER):
+    def _make_flat_card(self, parent, width, height, radius=None, outline=MAIN_BORDER):
         """A rounded-corner dark card (real tk.Frame has square corners
         only), drawn as a polygon on a Canvas. `width`/`height` are just the
         initial/minimum size - cards are gridded/packed to stretch, and the
@@ -1224,7 +1229,10 @@ class VolgasApp:
         (add="+") to reposition them. Not a Frame of packed widgets inside
         the canvas: every extra nested window re-lays-out and re-paints on
         each resize event, which made drag-resizing the window stutter.
-        `outline=""` for a border-free card (used for the wheel card)."""
+        `outline=""` for a border-free card (used for the wheel card).
+        width/height are real (already scaled) pixels."""
+        if radius is None:
+            radius = T.RADIUS_CARD  # read here, not as a default: it's scaled at start-up
         canvas = tk.Canvas(parent, width=width, height=height, bg=MAIN_BG, highlightthickness=0)
         bg_id = _draw_round_rect(canvas, 1, 1, width - 1, height - 1, radius,
                                   fill=MAIN_PANEL, outline=outline, width=1)
@@ -1369,7 +1377,9 @@ class VolgasApp:
         rectangular seam at the widget edge, and nesting a canvas inside the
         card made every resize repaint the card area twice.) The Main and
         Wheelbase tabs each build one; they share the keyed photo and all
-        follow the wheelbase position (_update_main_wheel). Returns the card."""
+        follow the wheelbase position (_update_main_wheel). width/height are
+        100%-display sizes. Returns the card."""
+        width, height = px(width), px(height)
         if not hasattr(self, "_wheel_cards"):
             self._wheel_cards = []  # one draw(angle) per card
             self._last_wheel_angle = 0.0
@@ -1381,11 +1391,11 @@ class VolgasApp:
         state = {"size": None, "base": None, "photo": None}
         # Without wheelbase controls (Home) the card has a title row and a
         # footer instead of the angle readout and Set Centre.
-        header_h = 0 if wheelbase_controls else 44
-        footer_h = 0 if wheelbase_controls else 52
+        header_h = 0 if wheelbase_controls else px(44)
+        footer_h = 0 if wheelbase_controls else px(52)
 
         def resize_photo(size):
-            size = max(40, int(size))
+            size = max(px(40), int(size))
             if size != state["size"]:
                 state["size"] = size
                 state["base"] = self._wheel_flat_full.resize((size, size), Image.LANCZOS)
@@ -1412,7 +1422,7 @@ class VolgasApp:
             # within the corner radius of the card's sides: the photo is an
             # opaque square, and its card-coloured corners mustn't cover the
             # card's rounded corners.
-            resize_photo(min(w - 40, h - 2 * CARD_PAD - 4 - header_h - footer_h))
+            resize_photo(min(w - px(40), h - 2 * CARD_PAD - px(4) - header_h - footer_h))
             draw(self._last_wheel_angle)
 
         # Resampling the photo costs several ms and a drag-resize sends dozens
@@ -1428,11 +1438,11 @@ class VolgasApp:
             # sit under the angle text above it.
             if wheelbase_controls:
                 canvas.coords(image_id, w / 2, h / 2 + WHEEL_VERTICAL_OFFSET)
-                canvas.coords(text_id, w / 2, CARD_PAD + 20)
+                canvas.coords(text_id, w / 2, CARD_PAD + px(20))
                 canvas.coords(centre_id, w / 2, WHEEL_CENTRE_BUTTON_Y)
             else:
                 canvas.coords(image_id, w / 2, (header_h + h - footer_h) / 2)
-                canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + 12)
+                canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + px(12))
                 canvas.coords(divider_id, T.SPACE_4, h - footer_h, w - T.SPACE_4, h - footer_h)
                 canvas.coords(foot_left_id, T.SPACE_4, h - footer_h / 2)
             resize_soon()
@@ -1441,7 +1451,7 @@ class VolgasApp:
         state["photo"] = ImageTk.PhotoImage(state["base"])
         image_id = canvas.create_image(0, 0, image=state["photo"])
         if not wheelbase_controls:
-            canvas.create_text(T.SPACE_4, T.SPACE_4 + 12, text="Steering wheel", font=T.FONT_TITLE,
+            canvas.create_text(T.SPACE_4, T.SPACE_4 + px(12), text="Steering wheel", font=T.FONT_TITLE,
                                fill=T.TEXT_PRIMARY, anchor="w")
             # The dash relays the wheel's buttons to Windows but doesn't
             # report the radio link to the PC yet, so say so honestly.
@@ -1453,13 +1463,13 @@ class VolgasApp:
             canvas.bind("<Configure>", on_resize, add="+")
             self._wheel_cards.append((canvas, draw))
             return canvas
-        text_id = canvas.create_text(0, CARD_PAD + 20, text="0°", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
+        text_id = canvas.create_text(0, CARD_PAD + px(20), text="0°", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
         # Set Centre sits right under the angle readout it zeroes. Card
         # background colour (MAIN_BORDER on MAIN_PANEL) so it stays visible on
         # the panel, unlike the top bar's MAIN_PANEL-on-MAIN_BG it used to be.
         centre_btn = tk.Button(canvas, text="Set Centre", font=("Segoe UI", 9), fg=MAIN_TEXT,
                                bg=MAIN_BORDER, activebackground=MAIN_CYAN, activeforeground=MAIN_BG,
-                               relief="flat", padx=12, pady=4, bd=0, cursor="hand2",
+                               relief="flat", padx=px(12), pady=px(4), bd=0, cursor="hand2",
                                command=lambda: self._wb_send_command(("reset_center",)))
         centre_id = canvas.create_window(0, WHEEL_CENTRE_BUTTON_Y, window=centre_btn, anchor="n")
         canvas.bind("<Configure>", on_resize, add="+")
@@ -1581,22 +1591,22 @@ class VolgasApp:
         # tab's throttle/brake gauges (_build_glow_pedal_card), just a
         # compact horizontal cut of it (_add_card_mini_bar) so the curve
         # cards below still have room without the tab needing to scroll.
-        bars_card = self._make_flat_card(root, 900, 56)
-        bars_card.pack(fill="x", padx=12, pady=(T.SPACE_3, 10))
+        bars_card = self._make_flat_card(root, px(900), px(56))
+        bars_card.pack(fill="x", padx=px(12), pady=(T.SPACE_3, px(10)))
         self.pedal_throttle_update = self._add_card_mini_bar(bars_card, 0, "THROTTLE", MAIN_GREEN)
         self.pedal_brake_update = self._add_card_mini_bar(bars_card, 1, "BRAKE", MAIN_RED)
 
         # Per-pedal response curve editors, side by side. Tighter outer/inter-card
         # padding than the rest of the tab so the plots themselves get the space.
         curves_row = tk.Frame(root, bg=MAIN_BG)
-        curves_row.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        curves_row.pack(fill="both", expand=True, padx=px(12), pady=(0, px(8)))
         curves_row.columnconfigure(0, weight=1)
         curves_row.columnconfigure(1, weight=1)
         curves_row.rowconfigure(0, weight=1)
         throttle_card = self._build_pedal_curve_card(curves_row, "throttle", "THROTTLE CURVE", MAIN_GREEN)
-        throttle_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        throttle_card.grid(row=0, column=0, sticky="nsew", padx=(0, px(4)))
         brake_card = self._build_pedal_curve_card(curves_row, "brake", "BRAKE CURVE", MAIN_RED)
-        brake_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        brake_card.grid(row=0, column=1, sticky="nsew", padx=(px(4), 0))
 
         # Actions - just a status line now; every calibration/curve change
         # applies AND saves to flash immediately (see _send_calibration),
@@ -1604,10 +1614,10 @@ class VolgasApp:
         # the raw hall/load numbers were only ever useful for eyeballing
         # calibration by hand, which the wizard replaced.
         act = tk.Frame(root, bg=MAIN_BG)
-        act.pack(fill="x", padx=12, pady=(0, 12))
+        act.pack(fill="x", padx=px(12), pady=(0, px(12)))
         self.status_label = tk.Label(act, text="Waiting for the pedals", font=T.FONT_CAPTION, fg=MAIN_TEXT_DIM,
                                      bg=MAIN_BG)
-        self.status_label.pack(side="left", padx=8)
+        self.status_label.pack(side="left", padx=px(8))
 
     def _add_card_mini_bar(self, card, column, label, color):
         """Compact single-row cut of the glow-pill bar style shared with
@@ -1626,8 +1636,8 @@ class VolgasApp:
 
         halo_color = _mix_color(MAIN_PANEL, color, 0.35)
         cap_color = _mix_color(color, "#ffffff", 0.55)
-        height = 18
-        pad = 2
+        height = px(18)
+        pad = px(2)
         r = (height - 2 * pad) / 2
         state = {"raw": 0}
 
@@ -1635,15 +1645,15 @@ class VolgasApp:
             w = card.winfo_width()
             if w <= 1:
                 return
-            col_gap = 32
+            col_gap = px(32)
             col_w = (w - 2 * CARD_PAD - col_gap) / 2
-            row_x, row_y = CARD_PAD + column * (col_w + col_gap) + 4, CARD_PAD + 4
-            row_w = col_w - 8
-            card.coords(name_id, row_x + 3, row_y + 1 + name_h / 2)
-            card.coords(value_id, row_x + row_w - 3, row_y + value_h / 2)
+            row_x, row_y = CARD_PAD + column * (col_w + col_gap) + px(4), CARD_PAD + px(4)
+            row_w = col_w - px(8)
+            card.coords(name_id, row_x + px(3), row_y + px(1) + name_h / 2)
+            card.coords(value_id, row_x + row_w - px(3), row_y + value_h / 2)
             card.delete(tag)
-            bx0, by0 = row_x + name_w + 8, row_y + 2
-            bx1, by1 = row_x + row_w - value_w - 8, by0 + height
+            bx0, by0 = row_x + name_w + px(8), row_y + px(2)
+            bx1, by1 = row_x + row_w - value_w - px(8), by0 + height
             if bx1 - bx0 <= 2 * pad:
                 return
             _draw_round_rect(card, bx0 + pad, by0 + pad, bx1 - pad, by1 - pad, r, fill=T.SURFACE_WELL, outline=MAIN_BORDER,
@@ -1651,11 +1661,11 @@ class VolgasApp:
             frac = max(0.0, min(1.0, state["raw"] / 1023.0))
             fill_x = bx0 + pad + frac * (bx1 - bx0 - 2 * pad)
             if fill_x > bx0 + pad + r:
-                halo_pad = 2
+                halo_pad = px(2)
                 _draw_round_rect(card, bx0 + pad - halo_pad, by0 + pad - halo_pad, fill_x + halo_pad,
                                   by1 - pad + halo_pad, r, fill=halo_color, outline="", tags=tag)
                 _draw_round_rect(card, bx0 + pad, by0 + pad, fill_x, by1 - pad, r, fill=color, outline="", tags=tag)
-                cap_w = 3
+                cap_w = px(3)
                 _draw_round_rect(card, max(bx0 + pad, fill_x - cap_w), by0 + pad, fill_x, by1 - pad, r,
                                   fill=cap_color, outline="", tags=tag)
 
@@ -1682,13 +1692,13 @@ class VolgasApp:
         # rather than packed in an inner Frame - one fewer layer to lay out
         # and repaint on every resize event. Offsets are the ones the old
         # packed layout had.
-        card = self._make_flat_card(parent, 420, 340)
+        card = self._make_flat_card(parent, px(420), px(340))
         title_font = ("Segoe UI", 11, "bold")
-        card.create_text(CARD_PAD + 3, CARD_PAD + 2 + _label_height(title_font) / 2, text=title, font=title_font,
-                         fill=MAIN_TEXT, anchor="w")
+        card.create_text(CARD_PAD + px(3), CARD_PAD + px(2) + _label_height(title_font) / 2, text=title,
+                         font=title_font, fill=MAIN_TEXT, anchor="w")
         calibrate = ui.FlatButton(card, "Calibrate", variant="primary", font=T.FONT_CAPTION, padx=12, pady=3,
                                   command=lambda k=pedal_key: self._open_calibrate_wizard(k))
-        calibrate_id = card.create_window(0, CARD_PAD + 2, window=calibrate, anchor="ne")
+        calibrate_id = card.create_window(0, CARD_PAD + px(2), window=calibrate, anchor="ne")
 
         # Curve is edited by dragging its 5 points directly on the plot
         # (see _curve_mouse_down/_drag/_up) rather than separate slider
@@ -1700,10 +1710,10 @@ class VolgasApp:
         # weighted row, so making the window taller enlarges the plot instead
         # of leaving dead space under it - a bigger plot for the same tab
         # footprint, not a taller tab.
-        canvas = tk.Canvas(card, height=220, bg=T.SURFACE_WELL, highlightthickness=1, highlightbackground=MAIN_BORDER,
-                           cursor="hand2")
-        plot_top = CARD_PAD + 34
-        plot_id = card.create_window(CARD_PAD + 2, plot_top, window=canvas, anchor="nw")
+        canvas = tk.Canvas(card, height=px(220), bg=T.SURFACE_WELL, highlightthickness=1,
+                           highlightbackground=MAIN_BORDER, cursor="hand2")
+        plot_top = CARD_PAD + px(34)
+        plot_id = card.create_window(CARD_PAD + px(2), plot_top, window=canvas, anchor="nw")
         if pedal_key == "throttle":
             self.throttle_curve_canvas = canvas
         else:
@@ -1730,16 +1740,16 @@ class VolgasApp:
         for label, values in presets:
             ui.FlatButton(preset_row, label, font=T.FONT_CAPTION, padx=10, pady=4,
                           command=lambda k=pedal_key, v=values: self._apply_curve_preset(k, v)).pack(side="left",
-                                                                                                    padx=3)
+                                                                                                    padx=px(3))
         preset_id = card.create_window(0, 0, window=preset_row, anchor="n")
 
         def layout(event):
             w, h = event.width, event.height
             preset_h = preset_row.winfo_reqheight()  # only known once Tk has laid the buttons out
-            card.coords(calibrate_id, w - CARD_PAD, CARD_PAD + 2)
+            card.coords(calibrate_id, w - CARD_PAD, CARD_PAD + px(2))
             # 8 px under the plot, then 2 px above the preset row, as packed before
-            card.itemconfig(plot_id, width=max(10, w - 2 * CARD_PAD - 4),
-                            height=max(10, h - CARD_PAD - preset_h - 10 - plot_top))
+            card.itemconfig(plot_id, width=max(10, w - 2 * CARD_PAD - px(4)),
+                            height=max(10, h - CARD_PAD - preset_h - px(10) - plot_top))
             card.coords(preset_id, w / 2, h - CARD_PAD - preset_h)
 
         card.bind("<Configure>", layout, add="+")
@@ -1747,7 +1757,8 @@ class VolgasApp:
         return card
 
     # Plot margins: room for the point labels above the top row and for the
-    # input-axis labels under the bottom row, so nothing is clipped.
+    # input-axis labels under the bottom row, so nothing is clipped. Scaled
+    # with the display at start-up (_scale_layout_constants).
     CURVE_PAD_X = 20
     CURVE_PAD_TOP = 22
     CURVE_PAD_BOTTOM = 26
@@ -1772,7 +1783,7 @@ class VolgasApp:
         if not xs:
             return
         nearest_i = min(range(len(xs)), key=lambda i: abs(xs[i] - event.x))
-        if abs(xs[nearest_i] - event.x) <= 28:  # only grab a point if the click is reasonably close to it
+        if abs(xs[nearest_i] - event.x) <= px(28):  # only grab a point if the click is reasonably close to it
             self._curve_drag = (pedal_key, nearest_i)
             self._curve_mouse_drag(event, pedal_key)
 
@@ -1823,23 +1834,24 @@ class VolgasApp:
         for i, var in enumerate(curve_vars):
             y = bottom - (bottom - top) * (var.get() / 100.0)
             pts += [xs[i], y]
-        canvas.create_line(*pts, fill=color, width=2)
+        canvas.create_line(*pts, fill=color, width=px(2))
+        dot, label_gap, edge = px(6), px(14), px(8)
         for i in range(0, len(pts), 2):
             x, y = pts[i], pts[i + 1]
-            canvas.create_oval(x - 6, y - 6, x + 6, y + 6, fill=color, outline=MAIN_TEXT, width=1)
+            canvas.create_oval(x - dot, y - dot, x + dot, y + dot, fill=color, outline=MAIN_TEXT, width=1)
             # Label above the point, unless that would leave the plot.
-            label_y = y - 14 if y - 14 >= 8 else y + 14
+            label_y = y - label_gap if y - label_gap >= edge else y + label_gap
             anchor = "center"
             if i == 0:
-                anchor, x = "w", x + 9
+                anchor, x = "w", x + px(9)
             elif i == len(pts) - 2:
-                anchor, x = "e", x - 9
+                anchor, x = "e", x - px(9)
             canvas.create_text(x, label_y, text=f"{curve_vars[i // 2].get()}%", fill=MAIN_TEXT,
                                font=T.FONT_CAPTION, anchor=anchor)
         for i, pct_label in enumerate(("0%", "25%", "50%", "75%", "100%")):
             anchor = "sw" if i == 0 else "se" if i == 4 else "s"
-            x = xs[i] - 4 if i == 0 else xs[i] + 4 if i == 4 else xs[i]
-            canvas.create_text(x, h - 5, text=pct_label, fill=MAIN_TEXT_DIM, font=T.FONT_CAPTION, anchor=anchor)
+            x = xs[i] - px(4) if i == 0 else xs[i] + px(4) if i == 4 else xs[i]
+            canvas.create_text(x, h - px(5), text=pct_label, fill=MAIN_TEXT_DIM, font=T.FONT_CAPTION, anchor=anchor)
         self._draw_curve_live_marker(pedal_key)
 
     def _draw_curve_live_marker(self, pedal_key):
@@ -1859,7 +1871,8 @@ class VolgasApp:
         x = left + (right - left) * frac
         y = bottom - (bottom - top) * out
         canvas.create_line(x, bottom, x, y, fill=T.ACCENT, dash=(2, 3), tags="live")
-        canvas.create_oval(x - 8, y - 8, x + 8, y + 8, outline=T.ACCENT, width=2, tags="live")
+        ring = px(8)
+        canvas.create_oval(x - ring, y - ring, x + ring, y + ring, outline=T.ACCENT, width=px(2), tags="live")
 
     def _open_calibrate_wizard(self, pedal_key):
         """Guided 2-step calibration for one pedal: capture it at rest, then
@@ -1897,16 +1910,18 @@ class VolgasApp:
                  bg=MAIN_PANEL).pack(anchor="w")
         step_label = tk.Label(body, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
         step_label.pack(anchor="w", pady=(T.SPACE_1, T.SPACE_4))
+        text_w, bar_w, bar_h = px(380), px(380), px(6)
         instruction = tk.Label(body, text="", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL,
-                               wraplength=380, justify="left")
+                               wraplength=text_w, justify="left")
         instruction.pack(anchor="w")
         reading = tk.Label(body, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
         reading.pack(anchor="w", pady=(T.SPACE_3, 0))
-        progress = tk.Canvas(body, width=380, height=6, bg=MAIN_PANEL, highlightthickness=0)
+        progress = tk.Canvas(body, width=bar_w, height=bar_h, bg=MAIN_PANEL, highlightthickness=0)
         progress.pack(anchor="w", pady=(T.SPACE_2, 0))
-        ui.draw_round_rect(progress, 0, 0, 380, 6, 3, fill=T.SURFACE_RAISED, outline="")
-        progress_fill = ui.draw_round_rect(progress, 0, 0, 0, 6, 3, fill=T.ACCENT, outline="", state="hidden")
-        message = tk.Label(body, text="", font=T.FONT_BODY, fg=T.STATUS_ERROR, bg=MAIN_PANEL, wraplength=380,
+        ui.draw_round_rect(progress, 0, 0, bar_w, bar_h, bar_h / 2, fill=T.SURFACE_RAISED, outline="")
+        progress_fill = ui.draw_round_rect(progress, 0, 0, 0, bar_h, bar_h / 2, fill=T.ACCENT, outline="",
+                                           state="hidden")
+        message = tk.Label(body, text="", font=T.FONT_BODY, fg=T.STATUS_ERROR, bg=MAIN_PANEL, wraplength=text_w,
                            justify="left")
         message.pack(anchor="w", pady=(T.SPACE_3, 0))
 
@@ -2003,7 +2018,7 @@ class VolgasApp:
                     state["samples"].append(v)
                 remaining = state["deadline"] - time.monotonic()
                 frac = 1.0 - max(0.0, remaining) / capture_s
-                progress.coords(progress_fill, *ui.round_rect_points(0, 0, max(6, 380 * frac), 6, 3))
+                progress.coords(progress_fill, *ui.round_rect_points(0, 0, max(bar_h, bar_w * frac), bar_h, bar_h / 2))
                 if remaining <= 0:
                     state["deadline"] = None
                     progress.itemconfig(progress_fill, state="hidden")
@@ -2021,7 +2036,7 @@ class VolgasApp:
         # a rounded flat card with one full-width glow-bar row per setting,
         # all stacked in a single column.
         top = tk.Frame(parent, bg=MAIN_BG)
-        top.pack(fill="x", padx=20, pady=(12, 8))
+        top.pack(fill="x", padx=px(20), pady=(px(12), px(8)))
         self.wb_status_label = tk.Label(top, text="no wheelbase support yet", font=("Segoe UI", 9),
                                         fg="gray", bg=MAIN_BG)
         self.wb_status_label.pack(side="left")
@@ -2031,7 +2046,7 @@ class VolgasApp:
         # the Main tab).
         tk.Button(top, text="Save & Reboot", font=("Segoe UI", 9), fg=MAIN_TEXT, bg=MAIN_PANEL,
                   activebackground=MAIN_BORDER, activeforeground=MAIN_TEXT, relief="flat",
-                  padx=12, pady=4, bd=0, cursor="hand2",
+                  padx=px(12), pady=px(4), bd=0, cursor="hand2",
                   command=lambda: self._wb_send_command(("save_and_reboot",))).pack(side="right")
 
         # name -> IntVar holding the field's real value for every setting on
@@ -2042,7 +2057,7 @@ class VolgasApp:
         # One name column wide enough for the longest name, so every bar
         # starts at the same x.
         names = [_wb_display_name(k).upper() for k in effect_keys + hardware_keys] + ["INTEGRATED SPRING"]
-        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + 24
+        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + px(24)
 
         # One card, one list: the effect settings, the Integrated Spring
         # switch, then the hardware settings, with no section headings
@@ -2053,10 +2068,10 @@ class VolgasApp:
         # is packed first (from the bottom) so if the window is short it's the
         # wheel card that gives up height, never the settings. Small
         # requested sizes so this tab doesn't raise the window's minimum size.
-        card = self._make_flat_card(parent, 520, WB_ROWS_TOP + (len(rows) + 1) * WB_ROW_H + CARD_PAD)
-        card.pack(side="bottom", fill="x", padx=20, pady=(0, 20))
-        wheel_card = self._build_wheel_card(parent, 200, 160)
-        wheel_card.pack(side="top", fill="y", expand=True, pady=(0, 12))
+        card = self._make_flat_card(parent, px(520), WB_ROWS_TOP + (len(rows) + 1) * WB_ROW_H + CARD_PAD)
+        card.pack(side="bottom", fill="x", padx=px(20), pady=(0, px(20)))
+        wheel_card = self._build_wheel_card(parent, 200, 160)  # 100% sizes
+        wheel_card.pack(side="top", fill="y", expand=True, pady=(0, px(12)))
 
         # Width follows height in the Main tab card's 600x480 proportions, so
         # the wheel fills its card the same way instead of sitting in a
@@ -2073,7 +2088,7 @@ class VolgasApp:
                 self._add_wb_spring_row(card, WB_ROWS_TOP + i * WB_ROW_H, name_w)
             else:
                 self._add_wb_slider_row(card, WB_ROWS_TOP + i * WB_ROW_H, key, name_w)
-        card.create_text(CARD_PAD + 4, WB_ROWS_TOP + len(rows) * WB_ROW_H + WB_ROW_H / 2,
+        card.create_text(CARD_PAD + px(4), WB_ROWS_TOP + len(rows) * WB_ROW_H + WB_ROW_H / 2,
                          text="Power Limit is a torque-limiting safety field - raise with care.",
                          font=("Segoe UI", 9), fill=MAIN_ORANGE_STATUS, anchor="w")
 
@@ -2086,13 +2101,13 @@ class VolgasApp:
         """A live picture of the ESP32 dash's screen (see _render_dash), on a
         flat card like the other pages."""
         size = DASH_SIZE * DASH_PREVIEW_SCALE
-        card = self._make_flat_card(parent, size + 2 * CARD_PAD + 40, size + 2 * CARD_PAD + 40)
-        card.pack(padx=20, pady=20)
+        card = self._make_flat_card(parent, size + 2 * CARD_PAD + px(40), size + 2 * CARD_PAD + px(40))
+        card.pack(padx=px(20), pady=px(20))
         self._dash_image_id = card.create_image(0, 0, anchor="center")
         frame_id = card.create_rectangle(0, 0, 0, 0, outline=MAIN_BORDER)
 
         def layout(event):
-            cx, cy = event.width / 2, CARD_PAD + 20 + size / 2
+            cx, cy = event.width / 2, CARD_PAD + px(20) + size / 2
             card.coords(self._dash_image_id, cx, cy)
             card.coords(frame_id, cx - size / 2 - 1, cy - size / 2 - 1, cx + size / 2, cy + size / 2)
 
@@ -2129,10 +2144,10 @@ class VolgasApp:
         flat card like the other pages: version, a check-on-startup switch,
         status, Check / Update buttons and the newer release's notes."""
         names = ["VERSION", "CHECK ON STARTUP", "STATUS", "WHAT'S NEW"]
-        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + 24
+        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + px(24)
         rows = 8  # version, switch, status, buttons, then four for release notes
-        card = self._make_flat_card(parent, 520, WB_ROWS_TOP + rows * WB_ROW_H + CARD_PAD)
-        card.pack(padx=20, pady=20)  # its own 520 px, not stretched to the window
+        card = self._make_flat_card(parent, px(520), WB_ROWS_TOP + rows * WB_ROW_H + CARD_PAD)
+        card.pack(padx=px(20), pady=px(20))  # its own 520 px, not stretched to the window
         x0 = CARD_PAD + name_w  # where values start, like the Wheelbase bars
 
         version_id, _ = self._add_wb_row_label(card, WB_ROWS_TOP, "VERSION")
@@ -2142,11 +2157,11 @@ class VolgasApp:
         on = {"value": self._wb_settings.get("check_updates_on_start", True)}
 
         def redraw_switch():
-            _draw_toggle(card, on["value"], x0, switch_mid - 10, tag="update_switch")
+            _draw_toggle(card, on["value"], x0, switch_mid - px(10), tag="update_switch")
             card.itemconfig(switch_value_id, text="On" if on["value"] else "Off")
 
         def press(event):
-            if x0 - 4 <= event.x <= x0 + 44 and switch_mid - 14 <= event.y <= switch_mid + 14:
+            if x0 - px(4) <= event.x <= x0 + px(44) and switch_mid - px(14) <= event.y <= switch_mid + px(14):
                 on["value"] = not on["value"]
                 self._wb_settings["check_updates_on_start"] = on["value"]
                 _save_settings(self._wb_settings)
@@ -2156,7 +2171,8 @@ class VolgasApp:
         redraw_switch()
 
         status_mid = WB_ROWS_TOP + 2 * WB_ROW_H + WB_ROW_H / 2
-        card.create_text(CARD_PAD + 4, status_mid, text="STATUS", font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
+        card.create_text(CARD_PAD + px(4), status_mid, text="STATUS", font=WB_NAME_FONT, fill=MAIN_TEXT_DIM,
+                         anchor="w")
         self._update_status_id = card.create_text(x0, status_mid, text="Not checked yet", font=("Segoe UI", 10),
                                                   fill=MAIN_TEXT, anchor="w")
 
@@ -2168,12 +2184,12 @@ class VolgasApp:
         card.create_window(x0, WB_ROWS_TOP + 3 * WB_ROW_H + WB_ROW_H / 2, window=buttons, anchor="w")
 
         notes_top = WB_ROWS_TOP + 4 * WB_ROW_H
-        self._update_notes_title_id = card.create_text(CARD_PAD + 4, notes_top + WB_ROW_H / 2, text="",
+        self._update_notes_title_id = card.create_text(CARD_PAD + px(4), notes_top + WB_ROW_H / 2, text="",
                                                        font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
-        self._update_notes_id = card.create_text(x0, notes_top + 8, text="", font=("Segoe UI", 9),
+        self._update_notes_id = card.create_text(x0, notes_top + px(8), text="", font=("Segoe UI", 9),
                                                  fill=MAIN_TEXT_DIM, anchor="nw")
         card.bind("<Configure>", lambda e: card.itemconfig(
-            self._update_notes_id, width=max(50, e.width - x0 - CARD_PAD - 8)), add="+")
+            self._update_notes_id, width=max(px(50), e.width - x0 - CARD_PAD - px(8))), add="+")
         self._settings_card = card
         self._fit_settings_card()
         self._build_support_card(parent)
@@ -2181,12 +2197,12 @@ class VolgasApp:
     def _build_support_card(self, parent):
         """Where Volgas keeps its files, a shortcut to the log for bug
         reports, and the experimental Wheelbase page switch."""
-        card, inner = self._make_frame_card(parent, 520, 190)
-        card.pack(padx=20, pady=(0, 20))
+        card, inner = self._make_frame_card(parent, 520, 190)  # 100% sizes
+        card.pack(padx=px(20), pady=(0, px(20)))
         tk.Label(inner, text="Support", font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(anchor="w")
         tk.Label(inner, text="Settings and logs are kept in:", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
                  bg=MAIN_PANEL).pack(anchor="w", pady=(T.SPACE_2, 0))
-        tk.Label(inner, text=data_dir(), font=T.FONT_CAPTION, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL, wraplength=460,
+        tk.Label(inner, text=data_dir(), font=T.FONT_CAPTION, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL, wraplength=px(460),
                  justify="left").pack(anchor="w")
         row = tk.Frame(inner, bg=MAIN_PANEL)
         row.pack(anchor="w", pady=(T.SPACE_3, 0))
@@ -2323,7 +2339,7 @@ class VolgasApp:
         if newer and exe_url and sha_url:
             self._set_update_status(f"Volgas v{version} is available")
             self._update_install_btn.config(text=f"Update to v{version}")
-            self._update_install_btn.pack(side="left", padx=(8, 0))
+            self._update_install_btn.pack(side="left", padx=(px(8), 0))
             card.itemconfig(self._update_notes_title_id, text="WHAT'S NEW")
             card.itemconfig(self._update_notes_id, text=notes.strip()[:600])
         else:
@@ -2353,9 +2369,9 @@ class VolgasApp:
         """Name on the left and value text on the right of one Wheelbase card
         row; returns (value_text_id, vertical centre of the row)."""
         mid = row_top + WB_ROW_H / 2
-        card.create_text(CARD_PAD + 4, mid, text=text, font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
+        card.create_text(CARD_PAD + px(4), mid, text=text, font=WB_NAME_FONT, fill=MAIN_TEXT_DIM, anchor="w")
         value_id = card.create_text(0, mid, text="", font=("Segoe UI", 11, "bold"), fill=MAIN_TEXT, anchor="e")
-        card.bind("<Configure>", lambda e: card.coords(value_id, e.width - CARD_PAD - 4, mid), add="+")
+        card.bind("<Configure>", lambda e: card.coords(value_id, e.width - CARD_PAD - px(4), mid), add="+")
         return value_id, mid
 
     def _add_wb_slider_row(self, card, row_top, name, name_w):
@@ -2380,7 +2396,7 @@ class VolgasApp:
         color = MAIN_CYAN if name == "MotionRange" else MAIN_BLUE  # matching the Main tab's Steering Range / FFB bars
         halo_color = _mix_color(MAIN_PANEL, color, 0.35)
         cap_color = _mix_color(color, "#ffffff", 0.55)
-        pad = 3
+        pad = px(3)
         y0, y1 = mid - WB_BAR_H / 2 + pad, mid + WB_BAR_H / 2 - pad
         r = (y1 - y0) / 2
         tag = f"wbrow_{name}"
@@ -2410,11 +2426,11 @@ class VolgasApp:
                               tags=tag)
             fill_x = x0 + pad + max(0.0, min(1.0, frac_of(value))) * (x1 - x0 - 2 * pad)
             if fill_x > x0 + pad + r:
-                halo_pad = 3
+                halo_pad = px(3)
                 _draw_round_rect(card, x0 + pad - halo_pad, y0 - halo_pad, fill_x + halo_pad, y1 + halo_pad,
                                   r, fill=halo_color, outline="", tags=tag)
                 _draw_round_rect(card, x0 + pad, y0, fill_x, y1, r, fill=color, outline="", tags=tag)
-                _draw_round_rect(card, max(x0 + pad, fill_x - 4), y0, fill_x, y1, r, fill=cap_color,
+                _draw_round_rect(card, max(x0 + pad, fill_x - px(4)), y0, fill_x, y1, r, fill=cap_color,
                                   outline="", tags=tag)
 
         def set_value(value):
@@ -2448,7 +2464,7 @@ class VolgasApp:
 
         def press(event):
             x0, x1 = bar_x()
-            if in_row(event) and x0 - 6 <= event.x <= x1 + 6:
+            if in_row(event) and x0 - px(6) <= event.x <= x1 + px(6):
                 state["dragging"] = True
                 set_from_x(event.x)
 
@@ -2485,14 +2501,14 @@ class VolgasApp:
         var = tk.IntVar(value=self._wb_remembered.get("IntegratedSpringStrength", 0))
         self.wb_field_vars["IntegratedSpringStrength"] = var
         value_id, mid = self._add_wb_row_label(card, row_top, "INTEGRATED SPRING")
-        x, y = CARD_PAD + name_w, mid - 10  # top-left of the 40x20 switch, where the bars start
+        x, y = CARD_PAD + name_w, mid - px(10)  # top-left of the 40x20 switch, where the bars start
 
         def redraw(*_args):
             _draw_toggle(card, var.get() > 0, x, y, tag="wb_spring_toggle")
             card.itemconfig(value_id, text=f"{var.get()}%" if var.get() > 0 else "Off")
 
         def press(event):
-            if x - 4 <= event.x <= x + 44 and y - 4 <= event.y <= y + 24:
+            if x - px(4) <= event.x <= x + px(44) and y - px(4) <= event.y <= y + px(24):
                 var.set(0 if var.get() > 0 else INTEGRATED_SPRING_ON_PCT)
                 self._remember_wb("IntegratedSpringStrength", var.get())
                 if self.wb_connected:
@@ -2755,7 +2771,10 @@ class VolgasApp:
             state = self._dash_preview_state()
             if state != self._home_dash_shown:
                 self._home_dash_shown = state
-                self._home_dash_photo = ImageTk.PhotoImage(_render_dash(state))
+                image = _render_dash(state)
+                if T.SCALE != 1.0:
+                    image = image.resize((px(DASH_SIZE), px(DASH_SIZE)), Image.NEAREST)
+                self._home_dash_photo = ImageTk.PhotoImage(image)
                 self._home_dash_image.config(image=self._home_dash_photo)
         self.root.after(self.STATUS_POLL_MS, self._status_poll)
 
@@ -2793,29 +2812,59 @@ class VolgasApp:
         self._set_pedal_status("Calibration read from the pedals", "ok")
 
 
-DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = -5
+DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
+PROCESS_SYSTEM_DPI_AWARE = 1
 
 
-def _enable_sharp_scaling():
-    """On a scaled display (125%, 150%...) Windows draws this DPI-unaware app
-    at 100% and stretches the bitmap, so everything looks fuzzy. GDI scaling
-    keeps the app unaware - every pixel size and the custom title bar stay
-    exactly as laid out - but has Windows re-render text, lines and shapes at
-    the real resolution. Photos are still stretched. Windows 10 1809+; must
-    run before the first window is created. Same as the exe's Compatibility
-    setting "Override high DPI scaling behaviour: System (Enhanced)"."""
+def _enable_dpi_awareness():
+    """On a scaled display (125%, 150%...) Windows drew this app at 100% and
+    stretched the picture, so everything looked fuzzy. Declaring it DPI aware
+    stops that: Windows draws it at the real resolution, and Volgas enlarges
+    its own pixel sizes instead (volgas_theme.init_scale,
+    _scale_layout_constants). System aware, not per-monitor: on a second
+    screen with a different scale Windows stretches it again, rather than Tk
+    having to re-lay-out the window on the fly. Must run before the first
+    window is created."""
     if sys.platform != "win32":
         return
     try:
         user32 = ctypes.windll.user32
         user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED)):
-            log.info("GDI scaling enabled")
-        else:
-            # Already set, e.g. by the exe's Compatibility settings or manifest.
-            log.info("GDI scaling not applied (DPI awareness already set, error %d)", ctypes.GetLastError())
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)):
+            return
     except (AttributeError, OSError):
-        log.info("GDI scaling unavailable on this Windows version")
+        pass  # before Windows 10 1703
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(PROCESS_SYSTEM_DPI_AWARE)  # Windows 8.1+
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            log.warning("could not make Volgas DPI aware - it may look fuzzy on a scaled display")
+
+
+# Layout sizes in pixels for a 100% display, multiplied by the display scale
+# at start-up. DASH_SIZE and the other DASH_* sizes are the dash's own screen
+# pixels, not the window's, so they stay as they are.
+_SCALED_LAYOUT_CONSTANTS = (
+    "SPLASH_LOGO_SIZE", "DEFAULT_WINDOW_W", "DEFAULT_WINDOW_H", "MAIN_WHEEL_CANVAS_SIZE",
+    "WHEEL_SOURCE_WORKING_SIZE", "WHEEL_VERTICAL_OFFSET", "CARD_PAD", "WHEEL_CENTRE_BUTTON_Y",
+    "WB_ROWS_TOP", "WB_ROW_H", "WB_BAR_H", "WB_VALUE_W",
+    "TITLE_BAR_H", "CAPTION_BUTTON_W", "TOP_RESIZE_BAND", "TOP_RESIZE_CORNER",
+)
+
+
+def _scale_layout_constants():
+    """Apply volgas_theme.SCALE to the layout constants. Call once, after
+    T.init_scale() and before building any interface."""
+    module = globals()
+    for name in _SCALED_LAYOUT_CONSTANTS:
+        module[name] = px(module[name])
+    # The dash preview is pixel art blown up with nearest-neighbour, so its
+    # magnification stays a whole number.
+    module["DASH_PREVIEW_SCALE"] = max(1, int(DASH_PREVIEW_SCALE * T.SCALE + 0.5))
+    for name in ("CURVE_PAD_X", "CURVE_PAD_TOP", "CURVE_PAD_BOTTOM"):
+        setattr(VolgasApp, name, px(getattr(VolgasApp, name)))
 
 
 # Same AppId as installer/Volgas.iss; Inno Setup names the uninstall entry after it.
@@ -2855,9 +2904,12 @@ if __name__ == "__main__":
     log_path = setup_logging(log_dir())
     log.info("Volgas %s starting (Python %s, %s), log: %s", VOLGAS_VERSION, sys.version.split()[0], sys.platform,
              log_path)
-    _enable_sharp_scaling()
+    _enable_dpi_awareness()
     _sync_installed_version()
     root = tk.Tk()
+    T.init_scale(root)
+    _scale_layout_constants()
+    log.info("display scale %.2f", T.SCALE)
     root.report_callback_exception = _report_callback_exception
     root.withdraw()
     splash = show_splash(root)
