@@ -2793,6 +2793,31 @@ class VolgasApp:
         self._set_pedal_status("Calibration read from the pedals", "ok")
 
 
+DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED = -5
+
+
+def _enable_sharp_scaling():
+    """On a scaled display (125%, 150%...) Windows draws this DPI-unaware app
+    at 100% and stretches the bitmap, so everything looks fuzzy. GDI scaling
+    keeps the app unaware - every pixel size and the custom title bar stay
+    exactly as laid out - but has Windows re-render text, lines and shapes at
+    the real resolution. Photos are still stretched. Windows 10 1809+; must
+    run before the first window is created. Same as the exe's Compatibility
+    setting "Override high DPI scaling behaviour: System (Enhanced)"."""
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED)):
+            log.info("GDI scaling enabled")
+        else:
+            # Already set, e.g. by the exe's Compatibility settings or manifest.
+            log.info("GDI scaling not applied (DPI awareness already set, error %d)", ctypes.GetLastError())
+    except (AttributeError, OSError):
+        log.info("GDI scaling unavailable on this Windows version")
+
+
 def _report_callback_exception(exc_type, exc, tb):
     """Tk swallows exceptions raised in event handlers and timers into
     stderr, which a windowed exe doesn't have - log them instead."""
@@ -2803,6 +2828,7 @@ if __name__ == "__main__":
     log_path = setup_logging(log_dir())
     log.info("Volgas %s starting (Python %s, %s), log: %s", VOLGAS_VERSION, sys.version.split()[0], sys.platform,
              log_path)
+    _enable_sharp_scaling()
     root = tk.Tk()
     root.report_callback_exception = _report_callback_exception
     root.withdraw()
