@@ -53,6 +53,7 @@ def _restart_if_borrowing_unpack_folder():
 
 _restart_if_borrowing_unpack_folder()
 
+import logging
 import tkinter as tk
 import urllib.error
 import urllib.request
@@ -66,6 +67,17 @@ from collections import deque
 from PIL import Image, ImageDraw, ImageTk
 
 import volgas_dash_font
+import volgas_theme as T
+import volgas_ui as ui
+from volgas_log import setup_logging
+from volgas_pedal_protocol import (
+    MSG_STATUS, MSG_SET_CALIBRATION, MSG_SAVE, MSG_GET_CALIBRATION,
+    MSG_CALIBRATION, MSG_SAVE_ACK, CAL_FMT, STATUS_FMT, CAL_SIZE, STATUS_SIZE, AXIS_MAX,
+    THROTTLE_LIMITS, BRAKE_LIMITS, CAPTURE_SECONDS, find_pedal_port, build_frame, FrameParser,
+    summarise, check_calibration, linear_fraction)
+from volgas_settings import data_dir, log_dir, load_settings as _load_settings, save_settings as _save_settings
+
+log = logging.getLogger("volgas")
 
 try:
     # volgas_dash_bridge.py auto-picks rFactor2 or Forza Horizon 5, whichever is
@@ -77,6 +89,7 @@ try:
     from volgas_dash_bridge import DashBridge
     DASH_BRIDGE_AVAILABLE = True
 except Exception:
+    logging.getLogger("volgas").exception("dash bridge unavailable - the dash and game telemetry are disabled")
     DASH_BRIDGE_AVAILABLE = False
 
 
@@ -153,7 +166,15 @@ def _install_update(new_path):
     if os.path.exists(old):
         os.remove(old)
     os.rename(exe, old)
-    os.rename(new_path, exe)
+    try:
+        os.rename(new_path, exe)
+    except OSError:
+        # Put the running exe back under its own name, so a failed swap
+        # never leaves the user without a Volgas.exe to start.
+        log.exception("update swap failed - restoring the previous Volgas.exe")
+        os.rename(old, exe)
+        raise
+    log.info("installed update from %s", new_path)
     # Without the reset, the new exe - at the path this one was started from -
     # takes the inherited _PYI_* variables as its own and runs from this
     # process's unpack folder, which is deleted when this one exits (seen on
@@ -161,28 +182,6 @@ def _install_update(new_path):
     # FileNotFoundError for the assets).
     subprocess.Popen([exe], close_fds=True, env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"})
 
-
-
-def _settings_path():
-    # Next to Volgas.exe on disk, not inside the onefile bundle's temp extraction dir.
-    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "volgas_settings.json")
-
-
-def _load_settings():
-    try:
-        with open(_settings_path(), "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_settings(settings):
-    try:
-        with open(_settings_path(), "w") as f:
-            json.dump(settings, f)
-    except Exception:
-        pass
 
 
 def asset_path(name):
@@ -194,7 +193,8 @@ def asset_path(name):
 # Startup splash, like the dash's showSplashScreen() in esp32_dash.ino: the
 # logo alone (no window background, no text) for 3 seconds.
 SPLASH_LOGO_SIZE = 300
-SPLASH_MS = 3000
+DEFAULT_WINDOW_W, DEFAULT_WINDOW_H = 1180, 760
+SPLASH_MS = 1500  # long enough to register, short enough not to be a wait
 SPLASH_KEY_COLOR = "#ff00ff"  # made see-through via -transparentcolor; not used anywhere in the logo
 
 
@@ -202,8 +202,13 @@ def show_splash(root):
     splash = tk.Toplevel(root)
     splash.overrideredirect(True)
     splash.attributes("-topmost", True)
-    splash.configure(bg=SPLASH_KEY_COLOR)
-    splash.attributes("-transparentcolor", SPLASH_KEY_COLOR)
+    if sys.platform == "win32":
+        splash.configure(bg=SPLASH_KEY_COLOR)
+        splash.attributes("-transparentcolor", SPLASH_KEY_COLOR)
+    else:
+        # -transparentcolor is Windows-only; elsewhere (development on macOS
+        # or Linux) show the logo on the app's background instead.
+        splash.configure(bg=T.SURFACE_WINDOW)
     x = (splash.winfo_screenwidth() - SPLASH_LOGO_SIZE) // 2
     y = (splash.winfo_screenheight() - SPLASH_LOGO_SIZE) // 2
     splash.geometry(f"{SPLASH_LOGO_SIZE}x{SPLASH_LOGO_SIZE}+{x}+{y}")
@@ -213,17 +218,12 @@ def show_splash(root):
     # soft alpha edge would blend into a magenta fringe - snap alpha to on/off.
     logo.putalpha(logo.getchannel("A").point(lambda a: 255 if a >= 128 else 0))
     splash.logo_photo = ImageTk.PhotoImage(logo)
-    tk.Label(splash, image=splash.logo_photo, bg=SPLASH_KEY_COLOR, borderwidth=0).place(
+    tk.Label(splash, image=splash.logo_photo, bg=splash.cget("bg"), borderwidth=0).place(
         relx=0.5, rely=0.5, anchor="center")
     splash.update()  # paint it now - VolgasApp's build runs before mainloop starts
     return splash
 
 
-# USBComposite defaults to LeafLabs' VID; PID is the one pedal_set.ino
-# sets explicitly (bumped to 0x0003 when CDC serial was added). Used to
-# find the Pedal Set's COM port automatically instead of picking by name.
-PEDAL_VID = 0x1EAF
-PEDAL_PID = 0x0003
 
 # FFBeast support was removed (user, 2026-10-31) ahead of Volgas's own
 # wheelbase firmware, so nothing talks to a wheelbase right now. The Wheelbase
@@ -291,17 +291,20 @@ WB_NAME_FONT = ("Segoe UI", 10, "bold")
 # wheel rotation arc) - plain tk widgets with explicit colors, not ttk, so
 # this is fully self-contained and doesn't touch the other tabs' native ttk
 # look.
-MAIN_BG = "#07080b"
-MAIN_PANEL = "#131620"
-MAIN_BORDER = "#262b3a"
-MAIN_TEXT = "#eef0f6"
-MAIN_TEXT_DIM = "#8a91a8"
-MAIN_RED = "#ff3b3b"
-MAIN_BLUE = "#2f8fff"
-MAIN_GREEN = "#39e26a"
-MAIN_CYAN = "#3fd4e0"
-MAIN_GRAY = "#5a6178"
-MAIN_ORANGE_STATUS = "#e0a030"
+# Legacy names kept for the existing drawing code; the values now come from
+# the design tokens in volgas_theme (better card separation and readable
+# secondary text - MAIN_GRAY was 2.9:1 against cards, now 4.7:1).
+MAIN_BG = T.SURFACE_WINDOW
+MAIN_PANEL = T.SURFACE_CARD
+MAIN_BORDER = T.BORDER
+MAIN_TEXT = T.TEXT_PRIMARY
+MAIN_TEXT_DIM = T.TEXT_SECONDARY
+MAIN_RED = T.BRAKE
+MAIN_BLUE = T.BLUE
+MAIN_GREEN = T.THROTTLE
+MAIN_CYAN = T.ACCENT
+MAIN_GRAY = T.TEXT_HINT
+MAIN_ORANGE_STATUS = T.STATUS_WARN
 
 
 def _rate_limited(widget, fn, interval_ms):
@@ -595,18 +598,6 @@ def _render_dash(state):
     return img
 
 
-SYNC0, SYNC1 = 0xAA, 0x55
-MSG_STATUS = 0x01
-MSG_SET_CALIBRATION = 0x02
-MSG_SAVE = 0x03
-MSG_GET_CALIBRATION = 0x04
-MSG_CALIBRATION = 0x84
-MSG_SAVE_ACK = 0x83
-
-# Must match pedal_protocol.h byte-for-byte (packed, little-endian).
-CAL_FMT = "<hhii5B5B"        # hallMin hallMax loadMin loadMax throttleCurve[5] brakeCurve[5]
-STATUS_FMT = "<hhiHH"        # hallRaw hallFiltered loadRaw throttleAxis brakeAxis
-
 # Curve presets (output % at input breakpoints 0/25/50/75/100%) offered as
 # one-click buttons next to each pedal's 5 curve sliders.
 CURVE_PRESET_LINEAR = (0, 25, 50, 75, 100)
@@ -618,65 +609,6 @@ CURVE_PRESET_REVERSE_EXPONENTIAL = (0, 50, 71, 87, 100)
 # pre-connect.
 DEFAULT_THROTTLE_CURVE = (0, 44, 66, 84, 100)
 DEFAULT_BRAKE_CURVE = CURVE_PRESET_LINEAR
-CAL_SIZE = struct.calcsize(CAL_FMT)
-STATUS_SIZE = struct.calcsize(STATUS_FMT)
-
-
-def find_pedal_port():
-    """Return the COM port of the Pedal Set by USB VID/PID, or None."""
-    for p in serial.tools.list_ports.comports():
-        if p.vid == PEDAL_VID and p.pid == PEDAL_PID:
-            return p.device
-    return None
-
-
-def build_frame(msg_type, payload=b""):
-    checksum = (msg_type + len(payload) + sum(payload)) & 0xFF
-    return bytes([SYNC0, SYNC1, msg_type, len(payload)]) + payload + bytes([checksum])
-
-
-class FrameParser:
-    """Same resync state machine as the firmware side."""
-
-    def __init__(self, on_frame):
-        self.on_frame = on_frame
-        self.reset()
-
-    def reset(self):
-        self.state = "SYNC0"
-        self.msg_type = 0
-        self.length = 0
-        self.payload = bytearray()
-        self.checksum = 0
-
-    def feed(self, data):
-        for b in data:
-            if self.state == "SYNC0":
-                if b == SYNC0:
-                    self.state = "SYNC1"
-            elif self.state == "SYNC1":
-                self.state = "TYPE" if b == SYNC1 else "SYNC0"
-            elif self.state == "TYPE":
-                self.msg_type = b
-                self.checksum = b
-                self.state = "LEN"
-            elif self.state == "LEN":
-                if b > 32:
-                    self.state = "SYNC0"
-                    continue
-                self.length = b
-                self.checksum = (self.checksum + b) & 0xFF
-                self.payload = bytearray()
-                self.state = "PAYLOAD" if b else "CHECKSUM"
-            elif self.state == "PAYLOAD":
-                self.payload.append(b)
-                self.checksum = (self.checksum + b) & 0xFF
-                if len(self.payload) >= self.length:
-                    self.state = "CHECKSUM"
-            elif self.state == "CHECKSUM":
-                if b == self.checksum:
-                    self.on_frame(self.msg_type, bytes(self.payload))
-                self.state = "SYNC0"
 
 
 def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=18, interior_leak_min_area=400):
@@ -839,7 +771,9 @@ class VolgasApp:
         self.ser = None
         self.reader = None
         self.rx_queue = queue.Queue()
-        self.parser = FrameParser(lambda t, p: self.rx_queue.put((t, p)))
+        self._pedal_stop = None   # stop event of the current pedal connection's reader
+        self._cal_loaded = False  # True once the pedals' own calibration has been read this connection
+        self._pedal_live = {"throttle": None, "brake": None}  # 0..1 input position, for the curve markers
         self.last_status = None
 
         # Raw calibration endpoints - not user-editable text fields anymore
@@ -861,104 +795,119 @@ class VolgasApp:
         self._wb_settings = _load_settings()
         self._wb_remembered = self._wb_settings.setdefault("wheelbase", {})
 
-        # A plain custom tab bar instead of ttk.Notebook, styled to match
-        # the dark theme, that doubles as the title bar - see
-        # _build_window_chrome and _hook_caption.
+        # Layout: the title bar across the top (row 0), a navigation rail
+        # down the left and the current page beside it (row 1). Pages are
+        # device-centred, Home first - see _build_home_tab.
+        self._show_wheelbase = bool(self._wb_settings.get("show_wheelbase", False))
         self.root.rowconfigure(1, weight=1)
-        self.root.columnconfigure(0, weight=1)
+        self.root.columnconfigure(1, weight=1)
         content = tk.Frame(self.root, bg=MAIN_BG)
-        content.grid(row=1, column=0, sticky="nsew")
+        content.grid(row=1, column=1, sticky="nsew")
         content.grid_rowconfigure(0, weight=1)
         content.grid_columnconfigure(0, weight=1)
 
-        main_tab = tk.Frame(content, bg=MAIN_BG)
-        pedals_tab = tk.Frame(content, bg=MAIN_BG)
-        wheelbase_tab = tk.Frame(content, bg=MAIN_BG)
-        dashboard_tab = tk.Frame(content, bg=MAIN_BG)
-        # Settings has no tab button - it's opened by clicking the logo.
-        settings_tab = tk.Frame(content, bg=MAIN_BG)
-        self._tab_frames = {"Main": main_tab, "Pedals": pedals_tab, "Wheelbase": wheelbase_tab,
-                            "Dashboard": dashboard_tab,
-                            "Settings": settings_tab}
+        page_names = ["Home", "Pedals", "Dash"]
+        if self._show_wheelbase:
+            # Hidden by default (no wheelbase backend exists yet); enable with
+            # "show_wheelbase": true in the settings file. Saved wheelbase
+            # values are kept either way.
+            page_names.append("Wheelbase")
+        page_names.append("Settings")
+        self._tab_frames = {name: tk.Frame(content, bg=MAIN_BG) for name in page_names}
         for frame in self._tab_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
 
         self._update_queue = queue.Queue()
         self._update_busy = False
-        self._build_main_tab(main_tab)
-        self._build_pedals_tab(pedals_tab)
-        self._build_wheelbase_tab(wheelbase_tab)
         self._dash_bridge = DashBridge() if DASH_BRIDGE_AVAILABLE else None
-        self._build_dashboard_tab(dashboard_tab)
-        self._build_settings_tab(settings_tab)
+        self._build_home_tab(self._tab_frames["Home"])
+        self._build_pedals_tab(self._tab_frames["Pedals"])
+        if self._show_wheelbase:
+            self._build_wheelbase_tab(self._tab_frames["Wheelbase"])
+        self._build_dashboard_tab(self._tab_frames["Dash"])
+        self._build_settings_tab(self._tab_frames["Settings"])
         self._caption_hwnd = _hook_caption(self.root)
-        self._build_window_chrome([n for n in self._tab_frames if n != "Settings"])
+        self._build_window_chrome()
+        self._build_nav_rail()
+        self.toaster = ui.Toaster(self.root)
 
-        # Floor the window at the size its content actually asks for (driven
-        # by the Main tab's card/gauge minimum sizes, see _build_main_tab).
-        # The native resize border is kept (see _hook_caption), so Windows
+        # Floor the window at the size its content actually asks for. The
+        # native resize border is kept (see _hook_caption), so Windows
         # enforces this during an interactive resize like any other app.
         self.root.update_idletasks()
         req_w, req_h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         self.root.minsize(req_w, req_h)
-        # Measured with every tab still gridded, so the floor fits the
-        # biggest tab. The explicit geometry stops the window following its
-        # requested size once only one tab is gridded, so switching tabs
+        # Measured with every page still gridded, so the floor fits the
+        # biggest page. The explicit geometry stops the window following its
+        # requested size once only one page is gridded, so switching pages
         # doesn't resize it.
-        self.root.geometry(f"{req_w}x{req_h}")
-        self._select_tab(next(iter(self._tab_frames)))
-        _apply_dark_titlebar(self.root, MAIN_BG, MAIN_BORDER, MAIN_TEXT)
+        # Open roomier than the minimum when the screen allows it.
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        start_w = max(req_w, min(DEFAULT_WINDOW_W, int(screen_w * 0.9)))
+        start_h = max(req_h, min(DEFAULT_WINDOW_H, int(screen_h * 0.85)))
+        self.root.geometry(f"{start_w}x{start_h}")
+        self._select_tab("Home")
+        _apply_dark_titlebar(self.root, T.SURFACE_RAIL, MAIN_BORDER, MAIN_TEXT)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._closing = False
 
         self._poll()
         self._auto_scan()
+        self._bridge_stop = threading.Event()
+        self._bridge_thread = None
         if DASH_BRIDGE_AVAILABLE:
-            # No tab of its own any more: the bridge runs in the background for
-            # the app's whole lifetime, finding the dash, picking up rFactor2 or
-            # Forza and reconnecting by itself (see volgas_dash_bridge).
-            threading.Thread(target=lambda: self._dash_bridge.run(threading.Event()), daemon=True).start()
+            # The bridge runs in the background for the app's whole lifetime,
+            # finding the dash, picking up rFactor2 or Forza and reconnecting
+            # by itself (see volgas_dash_bridge). _on_close stops it.
+            self._bridge_thread = threading.Thread(target=self._dash_bridge.run, args=(self._bridge_stop,),
+                                                   name="dash-bridge", daemon=True)
+            self._bridge_thread.start()
+        self._status_poll()
         self._remove_old_exe()
         if self._wb_settings.get("check_updates_on_start", True):
             self._start_update_check()
 
     # ---------- window chrome (dark tab strip as the title bar) ----------
 
-    def _build_window_chrome(self, tab_names):
-        """The tab strip, styled to match the dark theme and replacing
-        ttk.Notebook's own tab widget. With the native caption removed (see
-        _hook_caption) it is also the title bar: its empty space drags the
-        window (handing off to Windows' own move loop, so Snap and
-        drag-to-restore work), double-click maximizes, its top few pixels
-        resize, and it carries the min/max/close buttons. If the hook isn't
-        in place the native title bar stays above it instead."""
-        bar = tk.Frame(self.root, bg=MAIN_PANEL, height=TITLE_BAR_H)
-        bar.grid(row=0, column=0, sticky="ew")
+    def _build_window_chrome(self):
+        """The title bar: the Volgas mark, the current page's name, and live
+        status pills for the pedals, the dash and the game - so the state of
+        the rig is visible from every page. With the native caption removed
+        (see _hook_caption) it is also the window's title bar: its empty
+        space drags the window (handing off to Windows' own move loop, so
+        Snap and drag-to-restore work), double-click maximizes, its top few
+        pixels resize, and it carries the min/max/close buttons. If the hook
+        isn't in place the native title bar stays above it instead."""
+        bar = tk.Frame(self.root, bg=T.SURFACE_RAIL, height=TITLE_BAR_H)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
         bar.pack_propagate(False)
-        self.root.columnconfigure(0, weight=1)
 
-        # The Volgas mark leads the bar; clicking it opens the Settings page.
         logo_size = 24
         logo_im = Image.open(asset_path("volgas_logo.png")).convert("RGBA").resize((logo_size, logo_size), Image.LANCZOS)
         self._logo_photo = ImageTk.PhotoImage(logo_im)
-        logo = tk.Label(bar, image=self._logo_photo, bg=MAIN_PANEL, cursor="hand2")
-        logo.pack(side="left", padx=(14, 8))
-        logo.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
+        logo = tk.Label(bar, image=self._logo_photo, bg=T.SURFACE_RAIL)
+        # Centred over the navigation rail below it.
+        logo.pack(side="left", padx=((T.NAV_RAIL_W - logo_size) // 2, T.SPACE_3))
+        self._page_title = tk.Label(bar, text="", font=T.FONT_LABEL, fg=T.TEXT_PRIMARY, bg=T.SURFACE_RAIL)
+        self._page_title.pack(side="left")
 
-        self._tab_buttons = {}
-        for name in tab_names:
-            btn = tk.Label(bar, text=name.upper(), font=("Segoe UI", 9, "bold"),
-                            fg=MAIN_TEXT_DIM, bg=MAIN_PANEL, padx=14, cursor="hand2")
-            btn.pack(side="left", fill="y")
-            btn.bind("<Button-1>", lambda _e, n=name: self._select_tab(n))
-            self._tab_buttons[name] = btn
-
-        # Shown after the tabs when an update check finds a newer release.
-        self._update_badge = tk.Label(bar, text="Update available", font=("Segoe UI", 9, "bold"),
-                                      fg=MAIN_CYAN, bg=MAIN_PANEL, cursor="hand2")
+        # Shown when an update check finds a newer release.
+        self._update_badge = ui.StatusPill(bar, "warn", "Update available", bg=T.SURFACE_RAIL)
+        self._update_badge.config(cursor="hand2")
         self._update_badge.bind("<Button-1>", lambda _e: self._select_tab("Settings"))
+
+        if self._caption_hwnd:
+            self._build_caption_buttons(bar)
+        pills = tk.Frame(bar, bg=T.SURFACE_RAIL)
+        pills.pack(side="right", padx=(0, T.SPACE_3))
+        self._game_pill = ui.StatusPill(pills, "idle", "No game", bg=T.SURFACE_RAIL)
+        self._dash_pill = ui.StatusPill(pills, "idle", "Dash", bg=T.SURFACE_RAIL)
+        self._pedal_pill = ui.StatusPill(pills, "idle", "Pedals", bg=T.SURFACE_RAIL)
+        for pill in (self._game_pill, self._dash_pill, self._pedal_pill):
+            pill.pack(side="right", padx=(T.SPACE_2, 0))
 
         if not self._caption_hwnd:
             return
-        self._build_caption_buttons(bar)
         self._bar_press = None
         bar.bind("<ButtonPress-1>", self._on_bar_press)
         bar.bind("<B1-Motion>", self._on_bar_drag)
@@ -985,12 +934,12 @@ class VolgasApp:
                    ("min", lambda: user32.PostMessageW(self._caption_hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0),
                     MAIN_BORDER))
         for key, action, hover_bg in buttons:
-            btn = tk.Canvas(bar, width=CAPTION_BUTTON_W, height=TITLE_BAR_H, bg=MAIN_PANEL, highlightthickness=0)
+            btn = tk.Canvas(bar, width=CAPTION_BUTTON_W, height=TITLE_BAR_H, bg=T.SURFACE_RAIL, highlightthickness=0)
             btn.create_text(CAPTION_BUTTON_W // 2, TITLE_BAR_H // 2, text=CAPTION_GLYPHS[key],
                             font=glyph_font, fill=MAIN_TEXT, tags="glyph")
             btn.pack(side="right", fill="y")
             btn.bind("<Enter>", lambda _e, b=btn, bg=hover_bg: b.config(bg=bg))
-            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=MAIN_PANEL))
+            btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=T.SURFACE_RAIL))
             # Acts on release over the button, like the native ones.
             btn.bind("<ButtonRelease-1>",
                      lambda e, a=action: a() if 0 <= e.x < e.widget.winfo_width()
@@ -1077,11 +1026,31 @@ class VolgasApp:
             self._start_native_drag(hit, event)
             return "break"
 
+    PAGE_TITLES = {"Home": "Home", "Pedals": "Pedals", "Dash": "Dash", "Wheelbase": "Wheelbase",
+                   "Settings": "Settings"}
+
+    def _build_nav_rail(self):
+        """Page navigation down the left edge, Settings pinned at the bottom
+        where people expect it (it used to be reachable only by clicking the
+        logo)."""
+        self._nav = ui.NavRail(self.root, on_select=self._select_tab)
+        self._nav.grid(row=1, column=0, sticky="ns")
+        self._nav.add("Home", "Home", "home")
+        self._nav.add("Pedals", "Pedals", "pedals")
+        self._nav.add("Dash", "Dash", "dash")
+        if self._show_wheelbase:
+            self._nav.add("Wheelbase", "Base", "base")
+        self._nav.add("Settings", "Settings", "settings", bottom=True)
+
     def _select_tab(self, name):
-        for n, btn in self._tab_buttons.items():
-            selected = n == name
-            btn.config(bg=MAIN_BG if selected else MAIN_PANEL, fg=MAIN_TEXT if selected else MAIN_TEXT_DIM)
-        # Hidden tabs are taken out of the grid, not just stacked underneath
+        if name not in self._tab_frames:
+            return
+        self._current_page = name
+        if hasattr(self, "_nav"):
+            self._nav.select(name)
+        if hasattr(self, "_page_title"):
+            self._page_title.config(text=self.PAGE_TITLES.get(name, name))
+        # Hidden pages are taken out of the grid, not just stacked underneath
         # with tkraise(): stacked ones still got laid out and redrawn on
         # every resize event, which made dragging the window edge lag.
         for n, frame in self._tab_frames.items():
@@ -1089,100 +1058,49 @@ class VolgasApp:
                 frame.grid()
             else:
                 frame.grid_remove()
-        # A wheel card on the tab just shown skipped redraws while hidden -
+        # A wheel card on the page just shown skipped redraws while hidden -
         # catch it up once grid has mapped it (idle, after the layout pass).
         self.root.after_idle(self._refresh_wheel_cards)
         if name == "Wheelbase" and self.wb_connected:
-            # Refresh its fields from the device every time it's opened -
-            # they otherwise only got populated once, right after connect,
-            # and would show stale values after anything changed them
-            # elsewhere (e.g. the Main tab's sliders). Queued directly
-            # (not via _wb_send_command) so switching tabs while
-            # disconnected doesn't pop up a warning dialog.
+            # Refresh its fields from the device every time it's opened.
             self.wb_cmd_queue.put(("read_settings",))
 
     def _show_update_badge(self, show):
         if show:
-            self._update_badge.pack(side="left", fill="y", padx=(12, 0))
+            self._update_badge.pack(side="left", padx=(T.SPACE_3, 0))
         else:
             self._update_badge.pack_forget()
+        if hasattr(self, "_nav"):
+            self._nav.set_badge("Settings", show)
+
+    def _notify(self, text, kind="info"):
+        """Non-blocking message in the window corner (replaces pop-ups for
+        anything that doesn't need a decision)."""
+        log.info("notice (%s): %s", kind, text)
+        if hasattr(self, "toaster"):
+            self.toaster.show(text, kind)
 
     # ---------- UI ----------
 
-    def _build_main_tab(self, parent):
+    def _build_home_tab(self, parent):
+        """Home: the whole rig at a glance, one card per device. The wheel
+        fills the left side with its photo; the pedals and the dash share the
+        right. Every card shows its device's real connection state."""
         root = tk.Frame(parent, bg=MAIN_BG)
-        root.pack(fill="both", expand=True)
-        root.grid_columnconfigure(0, weight=1)
-        root.grid_rowconfigure(1, weight=1)  # the card row is the only part that grows tall
+        root.pack(fill="both", expand=True, padx=T.SPACE_5, pady=(T.SPACE_4, T.SPACE_5))
+        root.grid_columnconfigure(0, weight=23, uniform="home")
+        root.grid_columnconfigure(1, weight=20, uniform="home")
+        root.grid_rowconfigure(0, weight=1, uniform="home-rows")
+        root.grid_rowconfigure(1, weight=1, uniform="home-rows")
 
-        # ---- top bar: compact controls (status/enable/range/centre) ----
-        # No brand/logo here - the window chrome bar (see
-        # _build_window_chrome) is the only branding-free header now.
-        top = tk.Frame(root, bg=MAIN_BG)
-        top.grid(row=0, column=0, sticky="ew", padx=20, pady=(12, 8))
-
-        right_box = tk.Frame(top, bg=MAIN_BG)
-        right_box.pack(side="right")
-        self.main_wb_status_label = tk.Label(right_box, text="wheelbase: --", font=("Segoe UI", 9),
-                                              fg=MAIN_GRAY, bg=MAIN_BG, padx=12)
-        self.main_wb_status_label.pack(side="right")
-
+        # Wheelbase values the optional Wheelbase page shares (no controls on
+        # Home while the wheelbase isn't available).
         self.main_forces_enabled_var = tk.BooleanVar(value=bool(self._wb_remembered.get("ForceEnabled", 0)))
-        enable_box = tk.Frame(right_box, bg=MAIN_BG)
-        enable_box.pack(side="right", padx=(0, 16))
-        tk.Label(enable_box, text="Forces", font=("Segoe UI", 9),
-                 fg=MAIN_TEXT, bg=MAIN_BG).pack(side="left", padx=(0, 4))
-        self.main_forces_toggle = tk.Canvas(enable_box, width=40, height=20, bg=MAIN_BG, highlightthickness=0)
-        self.main_forces_toggle.pack(side="left")
-        self.main_forces_toggle.bind("<Button-1>", self._on_forces_enabled_toggle)
-        self._redraw_forces_toggle()
+        self.main_force_strength_var = tk.DoubleVar(value=self._wb_remembered.get("PowerLimit", 15))
+        self.main_motion_range_var = tk.DoubleVar(value=self._wb_remembered.get("MotionRange", 360))
 
-        # ---- middle row: brake | wheel rotation | throttle glow cards ----
-        # Grid (not pack) with column/row weights so the cards genuinely
-        # resize - not just sit centered with extra blank space - as the
-        # window grows, matching the rest of this tab's resizable layout.
-        row = tk.Frame(root, bg=MAIN_BG)
-        row.grid(row=1, column=0, sticky="nsew", padx=20, pady=8)
-        row.grid_columnconfigure(0, weight=1)
-        row.grid_columnconfigure(1, weight=2)
-        row.grid_columnconfigure(2, weight=1)
-        row.grid_rowconfigure(0, weight=1)
-
-        brake_card, self.main_brake_update = self._build_glow_pedal_card(row, "BRAKE", MAIN_RED)
-        brake_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-
-        wheel_card = self._build_wheel_card(row)
-        wheel_card.grid(row=0, column=1, sticky="nsew", padx=12)
-
-        throttle_card, self.main_throttle_update = self._build_glow_pedal_card(row, "THROTTLE", MAIN_GREEN)
-        throttle_card.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
-
-        # ---- bottom: Force Feedback Intensity + Steering Range, sharing one card ----
-        # Fixed height, so only x positions change on resize. y offsets are
-        # the ones the old packed Label/Canvas/Label stack had.
-        ffb_card = self._make_flat_card(root, 190 + 12 + 600 + 12 + 190, 290)
-        ffb_card.grid(row=2, column=0, sticky="ew", padx=20, pady=(8, 20))
-        saved_strength = self._wb_remembered.get("PowerLimit", 15)
-        self.main_force_strength_var = tk.DoubleVar(value=saved_strength)
-        self._add_card_hbar(
-            ffb_card, 0, "FORCE FEEDBACK INTENSITY", self.main_force_strength_var, 1, 100, MAIN_BLUE,
-            lambda v: f"{round(v)}% FFB", self._on_force_strength_release)
-
-        saved_range = self._wb_remembered.get("MotionRange", 360)
-        self.main_motion_range_var = tk.DoubleVar(value=saved_range)
-        self._add_card_hbar(
-            ffb_card, 101, "STEERING RANGE", self.main_motion_range_var, 90, 1080, MAIN_CYAN,
-            lambda v: f"{int(round(v))}°", self._on_motion_range_release)
-
-        preset_box = tk.Frame(ffb_card, bg=MAIN_PANEL)
-        for label, deg in (("360°", 360), ("540°", 540), ("900°", 900)):
-            tk.Button(preset_box, text=label, font=("Segoe UI", 9), fg=MAIN_TEXT,
-                      bg=MAIN_BORDER, activebackground=MAIN_CYAN, activeforeground=MAIN_BG,
-                      relief="flat", padx=16, pady=4, bd=0, cursor="hand2",
-                      command=lambda d=deg: self._set_motion_range_preset(d)).pack(side="left", padx=6)
-        preset_y = CARD_PAD + 208 + 14
-        preset_id = ffb_card.create_window(ffb_card.winfo_reqwidth() / 2, preset_y, window=preset_box)
-        ffb_card.bind("<Configure>", lambda e: ffb_card.coords(preset_id, e.width / 2, preset_y), add="+")
+        wheel_card = self._build_wheel_card(root, width=470, height=470, wheelbase_controls=False)
+        wheel_card.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, T.SPACE_3))
 
         pedals_card = self._build_home_pedals_card(root)
         pedals_card.grid(row=0, column=1, sticky="nsew", pady=(0, T.SPACE_2))
