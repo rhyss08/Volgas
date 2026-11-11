@@ -791,6 +791,14 @@ void loop() {
 
   pollTelemetry();
 
+  // Collapse the lap-time footer again once lap-time messages stop (e.g.
+  // switching from rFactor 2 to Forza, which sends none). This check was
+  // described above setFooterActive() but missing, so the footer stayed
+  // reserved until the next return to standby.
+  if (currentScreen == SCREEN_CLASSIC && footerActive && millis() - lastLapTimeMsgMs > FOOTER_DATA_TIMEOUT_MS) {
+    setFooterActive(false);
+  }
+
   if (currentScreen == SCREEN_CLASSIC && millis() - lastTelemetryMs > TELEMETRY_TIMEOUT_MS) {
     currentScreen = SCREEN_STANDBY;
     standbyScreenInit();

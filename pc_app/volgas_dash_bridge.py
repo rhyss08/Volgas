@@ -31,6 +31,7 @@ Usage: python volgas_dash_bridge.py
 
 Requires: pip install pyserial
 """
+import logging
 import struct
 import threading
 import time
@@ -92,6 +93,9 @@ def send_time_sync_burst(ser, stop_event, count=3, gap_s=0.3):
         stop_event.wait(gap_s)
 
 
+log = logging.getLogger(__name__)
+
+
 class DashBridge:
     """status_cb(str) is called with human-readable status changes (port
     found, which game is sending, frame counts, ...) instead of printing
@@ -108,6 +112,7 @@ class DashBridge:
         self.last_telemetry = None   # (t, (speed_kph, rpm, rpm_max, gear))
         self.last_lap_time = None    # (t, (lap_time_ms, valid))
         self.last_lap_delta = None   # (t, (delta_ms, valid))
+        self.active_source = None    # (t, "rf2" | "forza") - which game the last telemetry came from
 
     def run(self, stop_event):
         # Same outer-retry-loop shape as volgas_rf2_dash.DashBridge/
@@ -187,6 +192,7 @@ class DashBridge:
                         self.last_telemetry = (time.monotonic(), (speed_kph, rpm, rpm_max, gear))
                         sent += 1
                         last_active_source = source
+                        self.active_source = (time.monotonic(), source)
 
                         if source == "rf2":
                             # Same lap-time/delta logic as
@@ -243,6 +249,14 @@ class DashBridge:
                         stop_event.wait(remaining)
             except (serial.SerialException, OSError) as e:
                 self.status_cb(f"lost connection to the dash ({e}) - reconnecting...")
+                log.info("dash connection lost: %s", e)
+                stop_event.wait(2)
+            except Exception:
+                # Anything unexpected (e.g. a malformed game packet) used to end
+                # this thread silently, leaving the dash dead until a restart.
+                # Log it and start the connection over instead.
+                log.exception("dash bridge error - restarting the connection")
+                self.status_cb("unexpected error - restarting the dash connection...")
                 stop_event.wait(2)
             finally:
                 self.connected = False

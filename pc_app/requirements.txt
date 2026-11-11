@@ -1,0 +1,4 @@
+# Runtime dependencies of the Volgas PC app (Python 3.12).
+pyserial>=3.5
+Pillow>=10.0
+certifi>=2023.7.22
