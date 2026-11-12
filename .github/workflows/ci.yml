@@ -40,9 +40,17 @@ jobs:
       - name: Checksum
         shell: pwsh
         run: (Get-FileHash dist/Volgas.exe -Algorithm SHA256).Hash.ToLower() + "  Volgas.exe" | Out-File -Encoding ascii dist/Volgas.exe.sha256
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = (Select-String -Path volgas.py -Pattern '^VOLGAS_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\Volgas.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         with:
           name: Volgas-windows
           path: |
             pc_app/dist/Volgas.exe
             pc_app/dist/Volgas.exe.sha256
+            pc_app/dist/VolgasSetup.exe

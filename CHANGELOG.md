@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Sharp on laptops with display scaling (125%, 150%...): Volgas now handles the scaling itself instead of letting Windows stretch the window, which made everything fuzzy. Text, controls, gauges, curves, the wheel photo and the dash preview are drawn at the screen's real resolution, at the same size as before. At 100% nothing changes. `VOLGAS_UI_SCALE=1.5` (environment variable) previews the scaled layout on any computer, e.g. with `tools/simulate.py`.
+- New installer, `VolgasSetup.exe`: installs for your Windows account without admin rights, adds a Start menu entry, and lists Volgas under Settings → Apps with an Uninstall button. The in-app updater keeps working, and the installed-apps entry follows its updates. `Volgas.exe` on its own still works.
+
 ## 0.3.0 (2026-11-11)
 
 Phases 0 and 1 of the improvement plan (safety net and reliability), plus the first part of the new interface.

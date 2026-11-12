@@ -5,7 +5,13 @@ place.
 
 Contrast ratios below are measured against SURFACE_CARD (WCAG formula);
 4.5:1 is the usual minimum for readable text.
+
+Pixel sizes here and throughout the interface are for a 100% (96 DPI)
+display. init_scale() enlarges them for a scaled display (125%, 150%...);
+code with its own pixel numbers wraps them in px().
 """
+import os
+import sys
 
 # ---- surfaces (four depth levels, darkest at the back) ----
 SURFACE_WINDOW = "#0b0d11"    # window background
@@ -67,3 +73,42 @@ RADIUS_CARD = 12
 # ---- layout ----
 NAV_RAIL_W = 76
 TOAST_MS = 4500
+
+# ---- display scaling ----
+# Volgas tells Windows it handles scaling itself (see volgas.py), so Windows
+# no longer stretches the window - which made it fuzzy - and every pixel size
+# is multiplied by SCALE instead. Font sizes are in points, which Tk already
+# converts at the display's real DPI, so they need nothing.
+SCALE = 1.0
+_PIXEL_TOKENS = ("SPACE_1", "SPACE_2", "SPACE_3", "SPACE_4", "SPACE_5", "SPACE_6",
+                 "RADIUS_CONTROL", "RADIUS_CARD", "NAV_RAIL_W")
+_scaled = False
+
+
+def px(value):
+    """A pixel size for a 100% display, at the current display scale."""
+    return int(round(value * SCALE))
+
+
+def init_scale(root):
+    """Read the display scale and enlarge the pixel tokens above. Call once,
+    right after creating the Tk root and before building any interface.
+    VOLGAS_UI_SCALE (e.g. 1.5) overrides it, so the scaled layout can be
+    checked on any machine; macOS and Linux otherwise stay at 1, since Tk
+    already handles high-resolution screens there."""
+    global SCALE, _scaled
+    if _scaled:
+        return SCALE
+    _scaled = True
+    override = os.environ.get("VOLGAS_UI_SCALE")
+    if override:
+        scale = float(override)
+    elif sys.platform == "win32":
+        scale = root.winfo_fpixels("1i") / 96.0
+    else:
+        scale = 1.0
+    SCALE = min(4.0, max(1.0, round(scale, 3)))
+    module = globals()
+    for name in _PIXEL_TOKENS:
+        module[name] = px(module[name])
+    return SCALE

@@ -32,7 +32,8 @@ _BUTTON_STYLES = {
 
 class FlatButton(tk.Label):
     """A themed push button. command() runs on click, Enter or Space when
-    focused. set_enabled(False) greys it out and ignores input."""
+    focused. set_enabled(False) greys it out and ignores input. padx/pady
+    are for a 100% display and scaled here."""
 
     def __init__(self, master, text, command=None, variant="secondary", font=None, padx=14, pady=5,
                  selected=False, **kwargs):
@@ -43,7 +44,8 @@ class FlatButton(tk.Label):
         self._pressed = False
         self._selected = selected
         bg, _h, _p, fg, border = _BUTTON_STYLES[variant]
-        super().__init__(master, text=text, font=font or T.FONT_BODY, bg=bg, fg=fg, padx=padx, pady=pady,
+        super().__init__(master, text=text, font=font or T.FONT_BODY, bg=bg, fg=fg, padx=T.px(padx),
+                         pady=T.px(pady),
                          cursor="hand2", takefocus=1, highlightthickness=1, highlightbackground=border,
                          highlightcolor=T.TEXT_PRIMARY, **kwargs)
         self.bind("<Enter>", self._on_enter)
@@ -128,7 +130,7 @@ class StatusPill(tk.Canvas):
 
     def __init__(self, master, kind="idle", text="", bg=T.SURFACE_CARD, font=None):
         self._font = tkfont.Font(font=font or T.FONT_CAPTION)
-        h = self._font.metrics("linespace") + 8
+        h = self._font.metrics("linespace") + T.px(8)
         super().__init__(master, height=h, width=10, bg=bg, highlightthickness=0, bd=0)
         self._kind, self._text = None, None
         self.set(kind, text)
@@ -139,15 +141,15 @@ class StatusPill(tk.Canvas):
         self._kind, self._text = kind, text
         fill, fg = STATUS_STYLES.get(kind, STATUS_STYLES["idle"])
         h = int(self.cget("height"))
-        dot = 7
+        dot, left, gap, right = T.px(7), T.px(10), T.px(6), T.px(12)
         text_w = self._font.measure(text)
-        w = 10 + dot + 6 + text_w + 12
+        w = left + dot + gap + text_w + right
         self.config(width=w)
         self.delete("all")
         draw_round_rect(self, 0, 0, w, h, h / 2, fill=fill, outline="")
         cy = h / 2
-        self.create_oval(10, cy - dot / 2, 10 + dot, cy + dot / 2, fill=fg, outline="")
-        self.create_text(10 + dot + 6, cy, text=text, fill=fg, font=self._font, anchor="w")
+        self.create_oval(left, cy - dot / 2, left + dot, cy + dot / 2, fill=fg, outline="")
+        self.create_text(left + dot + gap, cy, text=text, fill=fg, font=self._font, anchor="w")
 
 
 # ---------- toasts ----------
@@ -166,10 +168,10 @@ class Toaster:
     def show(self, text, kind="info", ms=T.TOAST_MS):
         fill, fg = STATUS_STYLES.get(kind, STATUS_STYLES["info"])
         frame = tk.Frame(self.root, bg=fill, highlightthickness=1, highlightbackground=fg, cursor="hand2")
-        bar = tk.Frame(frame, bg=fg, width=4)
+        bar = tk.Frame(frame, bg=fg, width=T.px(4))
         bar.pack(side="left", fill="y")
         label = tk.Label(frame, text=text, font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=fill, justify="left",
-                         wraplength=360, padx=12, pady=10)
+                         wraplength=T.px(360), padx=T.px(12), pady=T.px(10))
         label.pack(side="left")
         for w in (frame, label, bar):
             w.bind("<Button-1>", lambda _e, f=frame: self._dismiss(f))
@@ -196,46 +198,50 @@ class Toaster:
 
 
 # ---------- navigation rail ----------
+# Icons are drawn on a 100%-display grid around (cx, cy); k is the display
+# scale and lw the scaled line width.
 
-def _icon_home(c, cx, cy, col):
-    c.create_line(cx - 9, cy - 1, cx, cy - 9, cx + 9, cy - 1, fill=col, width=2, capstyle="round", joinstyle="round")
-    c.create_line(cx - 6, cy - 3, cx - 6, cy + 8, cx + 6, cy + 8, cx + 6, cy - 3, fill=col, width=2,
-                  joinstyle="round")
-
-
-def _icon_wheel(c, cx, cy, col):
-    c.create_oval(cx - 9, cy - 9, cx + 9, cy + 9, outline=col, width=2)
-    c.create_oval(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, outline=col, width=2)
-    c.create_line(cx - 9, cy, cx - 2.5, cy, fill=col, width=2)
-    c.create_line(cx + 2.5, cy, cx + 9, cy, fill=col, width=2)
-    c.create_line(cx, cy + 2.5, cx, cy + 9, fill=col, width=2)
+def _icon_home(c, cx, cy, col, k, lw):
+    c.create_line(cx - 9 * k, cy - 1 * k, cx, cy - 9 * k, cx + 9 * k, cy - 1 * k, fill=col, width=lw,
+                  capstyle="round", joinstyle="round")
+    c.create_line(cx - 6 * k, cy - 3 * k, cx - 6 * k, cy + 8 * k, cx + 6 * k, cy + 8 * k, cx + 6 * k, cy - 3 * k,
+                  fill=col, width=lw, joinstyle="round")
 
 
-def _icon_pedals(c, cx, cy, col):
-    draw_round_rect(c, cx - 9, cy - 8, cx - 2, cy + 9, 2, outline=col, width=2, fill="")
-    draw_round_rect(c, cx + 2, cy - 4, cx + 9, cy + 9, 2, outline=col, width=2, fill="")
+def _icon_wheel(c, cx, cy, col, k, lw):
+    c.create_oval(cx - 9 * k, cy - 9 * k, cx + 9 * k, cy + 9 * k, outline=col, width=lw)
+    c.create_oval(cx - 2.5 * k, cy - 2.5 * k, cx + 2.5 * k, cy + 2.5 * k, outline=col, width=lw)
+    c.create_line(cx - 9 * k, cy, cx - 2.5 * k, cy, fill=col, width=lw)
+    c.create_line(cx + 2.5 * k, cy, cx + 9 * k, cy, fill=col, width=lw)
+    c.create_line(cx, cy + 2.5 * k, cx, cy + 9 * k, fill=col, width=lw)
 
 
-def _icon_dash(c, cx, cy, col):
-    c.create_arc(cx - 10, cy - 8, cx + 10, cy + 12, start=0, extent=180, style="arc", outline=col, width=2)
+def _icon_pedals(c, cx, cy, col, k, lw):
+    draw_round_rect(c, cx - 9 * k, cy - 8 * k, cx - 2 * k, cy + 9 * k, 2 * k, outline=col, width=lw, fill="")
+    draw_round_rect(c, cx + 2 * k, cy - 4 * k, cx + 9 * k, cy + 9 * k, 2 * k, outline=col, width=lw, fill="")
+
+
+def _icon_dash(c, cx, cy, col, k, lw):
+    c.create_arc(cx - 10 * k, cy - 8 * k, cx + 10 * k, cy + 12 * k, start=0, extent=180, style="arc", outline=col,
+                 width=lw)
     angle = math.radians(40)
-    c.create_line(cx, cy + 2, cx + 7 * math.cos(angle), cy + 2 - 7 * math.sin(angle), fill=col, width=2,
-                  capstyle="round")
-    c.create_line(cx - 10, cy + 8, cx + 10, cy + 8, fill=col, width=2)
+    c.create_line(cx, cy + 2 * k, cx + 7 * k * math.cos(angle), cy + 2 * k - 7 * k * math.sin(angle), fill=col,
+                  width=lw, capstyle="round")
+    c.create_line(cx - 10 * k, cy + 8 * k, cx + 10 * k, cy + 8 * k, fill=col, width=lw)
 
 
-def _icon_base(c, cx, cy, col):
-    c.create_oval(cx - 9, cy - 9, cx + 9, cy + 9, outline=col, width=2)
-    c.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill=col, outline="")
+def _icon_base(c, cx, cy, col, k, lw):
+    c.create_oval(cx - 9 * k, cy - 9 * k, cx + 9 * k, cy + 9 * k, outline=col, width=lw)
+    c.create_oval(cx - 4 * k, cy - 4 * k, cx + 4 * k, cy + 4 * k, fill=col, outline="")
 
 
-def _icon_settings(c, cx, cy, col):
+def _icon_settings(c, cx, cy, col, k, lw):
     for i in range(8):
         a = i * math.pi / 4
-        c.create_line(cx + 6 * math.cos(a), cy + 6 * math.sin(a), cx + 10 * math.cos(a), cy + 10 * math.sin(a),
-                      fill=col, width=3, capstyle="round")
-    c.create_oval(cx - 6.5, cy - 6.5, cx + 6.5, cy + 6.5, outline=col, width=2)
-    c.create_oval(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, outline=col, width=2)
+        c.create_line(cx + 6 * k * math.cos(a), cy + 6 * k * math.sin(a), cx + 10 * k * math.cos(a),
+                      cy + 10 * k * math.sin(a), fill=col, width=T.px(3), capstyle="round")
+    c.create_oval(cx - 6.5 * k, cy - 6.5 * k, cx + 6.5 * k, cy + 6.5 * k, outline=col, width=lw)
+    c.create_oval(cx - 2.5 * k, cy - 2.5 * k, cx + 2.5 * k, cy + 2.5 * k, outline=col, width=lw)
 
 
 NAV_ICONS = {"home": _icon_home, "wheel": _icon_wheel, "pedals": _icon_pedals, "dash": _icon_dash,
@@ -247,7 +253,7 @@ class NavRail(tk.Frame):
     adds an item; select(key) marks it current. on_select(key) runs on
     click or keyboard activation."""
 
-    ITEM_H = 62
+    ITEM_H = 62  # at 100%; scaled where used
 
     def __init__(self, master, on_select):
         super().__init__(master, bg=T.SURFACE_RAIL, width=T.NAV_RAIL_W)
@@ -262,7 +268,7 @@ class NavRail(tk.Frame):
         self._bottom.pack(side="bottom", fill="x", pady=(0, T.SPACE_2))
 
     def add(self, key, label, icon, bottom=False):
-        c = tk.Canvas(self._bottom if bottom else self._top, width=T.NAV_RAIL_W, height=self.ITEM_H,
+        c = tk.Canvas(self._bottom if bottom else self._top, width=T.NAV_RAIL_W, height=T.px(self.ITEM_H),
                       bg=T.SURFACE_RAIL, highlightthickness=0, cursor="hand2", takefocus=1)
         c.pack(side="top")
         item = {"canvas": c, "label": label, "icon": icon, "hover": False, "badge": False}
@@ -296,16 +302,19 @@ class NavRail(tk.Frame):
         selected = key == self._current
         focused = c.focus_displayof() is c if c.winfo_exists() else False
         c.delete("all")
-        w, h = T.NAV_RAIL_W, self.ITEM_H
+        p, k = T.px, T.SCALE
+        w, h = T.NAV_RAIL_W, p(self.ITEM_H)
         if selected or item["hover"]:
-            draw_round_rect(c, 6, 3, w - 6, h - 3, T.RADIUS_CONTROL,
+            draw_round_rect(c, p(6), p(3), w - p(6), h - p(3), T.RADIUS_CONTROL,
                             fill=T.SURFACE_RAISED if selected else "#181c23", outline="")
         if selected:
-            c.create_rectangle(0, 14, 3, h - 14, fill=T.ACCENT, outline="")
+            c.create_rectangle(0, p(14), p(3), h - p(14), fill=T.ACCENT, outline="")
         if focused:
-            draw_round_rect(c, 5, 2, w - 5, h - 2, T.RADIUS_CONTROL, outline=T.TEXT_SECONDARY, fill="", width=1)
+            draw_round_rect(c, p(5), p(2), w - p(5), h - p(2), T.RADIUS_CONTROL, outline=T.TEXT_SECONDARY, fill="",
+                            width=1)
         col = T.TEXT_PRIMARY if selected else T.TEXT_SECONDARY
-        NAV_ICONS[item["icon"]](c, w / 2, 24, T.ACCENT if selected else col)
-        c.create_text(w / 2, h - 13, text=item["label"], fill=col, font=T.FONT_NAV)
+        NAV_ICONS[item["icon"]](c, w / 2, p(24), T.ACCENT if selected else col, k, p(2))
+        c.create_text(w / 2, h - p(13), text=item["label"], fill=col, font=T.FONT_NAV)
         if item["badge"]:
-            c.create_oval(w / 2 + 9, 11, w / 2 + 17, 19, fill=T.STATUS_WARN, outline=T.SURFACE_RAIL, width=2)
+            c.create_oval(w / 2 + p(9), p(11), w / 2 + p(17), p(19), fill=T.STATUS_WARN, outline=T.SURFACE_RAIL,
+                          width=p(2))
