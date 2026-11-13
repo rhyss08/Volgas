@@ -432,8 +432,13 @@ void footerDrawDelta(int32_t deltaMs, bool valid) {
 // from "do we know the time".
 const char* dayNames[7] = { "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday" };
 
+const char* monthNames[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
 bool hasTimeSync = false;   // one-way latch - true forever once the first sync arrives
+bool hasDateSync = false;   // same, for the calendar date (older Volgas versions never send one)
 uint8_t syncedDayOfWeek = 0, syncedHour = 0, syncedMinute = 0, syncedSecond = 0;
+uint8_t syncedDay = 1, syncedMonth = 1;
+uint16_t syncedYear = 2000;
 unsigned long lastTimeSyncMs = 0;   // millis() when the above was captured - anchor for computeCurrentTime(), and for appConnected's recency check
 const unsigned long APP_TIMEOUT_MS = 15000;   // PC resyncs every ~5s while connected (volgas_rf2_dash.py TIME_SYNC_PERIOD_S) - 3x margin before calling the app disconnected
 
@@ -451,6 +456,31 @@ void computeCurrentTime(uint8_t& dayOfWeek, uint8_t& hour, uint8_t& minute) {
   dayOfWeek = (syncedDayOfWeek + dayRollover) % 7;
   hour = totalHour % 24;
   minute = totalMin % 60;
+}
+
+uint8_t daysInMonth(uint8_t month, uint16_t year) {
+  static const uint8_t days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+  return (month == 2 && leap) ? 29 : days[(month - 1) % 12];
+}
+
+// The synced date plus the whole days that have passed since (the same
+// elapsed-time basis as computeCurrentTime).
+void computeCurrentDate(uint8_t& day, uint8_t& month) {
+  unsigned long elapsedSec = (millis() - lastTimeSyncMs) / 1000;
+  unsigned long totalHour = syncedHour + (syncedMinute + (syncedSecond + elapsedSec) / 60) / 60;
+  unsigned long daysToAdd = totalHour / 24;
+  if (daysToAdd > 3660) daysToAdd = 3660;   // a corrupt anchor shouldn't spin here
+  uint8_t d = syncedDay, m = syncedMonth;
+  uint16_t y = syncedYear;
+  while (daysToAdd--) {
+    if (++d > daysInMonth(m, y)) {
+      d = 1;
+      if (++m > 12) { m = 1; y++; }
+    }
+  }
+  day = d;
+  month = m;
 }
 
 int16_t standbyLastMinute = -1;
@@ -509,7 +539,14 @@ void standbyDrawTime(uint8_t dayOfWeek, uint8_t hour, uint8_t minute) {
   tft.setCursor(tx, ty + 2);
   tft.print(timebuf);
 
-  const char* day = dayNames[dayOfWeek % 7];
+  char day[28];   // "Wednesday 30 Sep" at most
+  if (hasDateSync) {
+    uint8_t dom, mon;
+    computeCurrentDate(dom, mon);
+    snprintf(day, sizeof(day), "%s %u %s", dayNames[dayOfWeek % 7], dom, monthNames[(mon - 1) % 12]);
+  } else {
+    snprintf(day, sizeof(day), "%s", dayNames[dayOfWeek % 7]);
+  }
   int16_t dx = (SCREEN_W - (int16_t)strlen(day) * 6) / 2;   // ~6px per size-1 char
   int16_t dy = top + STANDBY_DAY_OFFSET;
   tft.fillRect(0, dy, SCREEN_W, 10, ST7735_BLACK);
@@ -585,6 +622,11 @@ void standbyScreenUpdate(bool wheelOk) {
   if (hasTimeSync) {
     uint8_t dow, hr, mn;
     computeCurrentTime(dow, hr, mn);
+    static bool lastDrawnWithDate = false;
+    if (hasDateSync != lastDrawnWithDate) {   // the date arrived after the first draw
+      lastDrawnWithDate = hasDateSync;
+      standbyLastMinute = -1;
+    }
     if (mn != standbyLastMinute || dow != standbyLastDay) {
       standbyDrawTime(dow, hr, mn);
       standbyLastMinute = mn;
@@ -638,6 +680,16 @@ void handleDashMessage(uint8_t msgType, const uint8_t* payload, uint8_t msgLen) 
     syncedSecond = ts.second;
     hasTimeSync = true;   // one-way latch - see STANDBY SCREEN section
     lastTimeSyncMs = millis();
+  } else if (msgType == MSG_DATE_SYNC && msgLen == sizeof(DateSync)) {
+    // Follows its TimeSync straight away, so it shares that sync's anchor time.
+    DateSync ds;
+    memcpy(&ds, payload, sizeof(DateSync));
+    if (ds.day >= 1 && ds.day <= 31 && ds.month >= 1 && ds.month <= 12) {
+      syncedDay = ds.day;
+      syncedMonth = ds.month;
+      syncedYear = ds.year;
+      hasDateSync = true;
+    }
   } else if (msgType == MSG_LAP_TIME && msgLen == sizeof(LapTime)) {
     LapTime lt;
     memcpy(&lt, payload, sizeof(LapTime));
@@ -711,7 +763,12 @@ void pollTelemetry() {
 //   RADIO LINK TO THE HUB (see volgas_link.h)
 // ==========================================
 const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-const uint16_t WHEEL_FW_VERSION = 5;   // bump for every release - the hub and Volgas show it (1 = first radio link, 2 = wireless updates, 3 = backlight on GPIO7, 4 = hub status only shown when lost, 5 = clock centred)
+// Bump for every release - the hub and Volgas show it. 16 bits: below 256 a
+// plain number (releases 1-5: radio link, wireless updates, backlight on
+// GPIO7, hub status only when lost, clock centred); from 5.1 on it's
+// major << 8 | minor (volgas_devices.format_wheel_version), so 0x0501 is 5.1
+// and still compares higher than the old plain 5.
+const uint16_t WHEEL_FW_VERSION = 0x0501;   // 5.1: the date next to the day on the standby clock
 
 struct RxPacket {
   uint8_t mac[6];

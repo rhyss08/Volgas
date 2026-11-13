@@ -33,6 +33,7 @@
 #define MSG_TIME_SYNC      0x02   // PC -> ESP32-S3
 #define MSG_LAP_TIME       0x03   // PC -> ESP32-S3, current lap running time, sent periodically while on track
 #define MSG_LAP_DELTA      0x04   // PC -> ESP32-S3, sent once per sector crossing (was MSG_SECTOR_SPLIT, a temporary overlay - simplified 2026-07-25 into a persistent readout)
+#define MSG_DATE_SYNC      0x05   // PC -> ESP32-S3, sent with every MSG_TIME_SYNC; firmware that doesn't know it ignores it (the standby screen then shows the day name only)
 
 struct __attribute__((packed)) DashTelemetry {
   uint16_t speedKph;
@@ -94,4 +95,13 @@ struct __attribute__((packed)) TimeSync {
   uint8_t hour;     // 0-23
   uint8_t minute;   // 0-59
   uint8_t second;   // 0-59
+};
+
+// The calendar date that goes with a TimeSync (a separate message so a
+// TimeSync stays the size older firmware expects). The dash rolls it over
+// itself at midnight between syncs.
+struct __attribute__((packed)) DateSync {
+  uint8_t  day;     // 1-31
+  uint8_t  month;   // 1-12
+  uint16_t year;    // e.g. 2026
 };

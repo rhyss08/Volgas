@@ -77,8 +77,10 @@ MSG_DASH_TELEMETRY = 0x01
 MSG_TIME_SYNC = 0x02
 MSG_LAP_TIME = 0x03
 MSG_LAP_DELTA = 0x04
+MSG_DATE_SYNC = 0x05
 TELEMETRY_FMT = "<HHHb"
 TIME_SYNC_FMT = "<BBBB"
+DATE_SYNC_FMT = "<BBH"
 LAP_TIME_FMT = "<IB"
 LAP_DELTA_FMT = "<iB"
 SEND_HZ = 20
@@ -111,6 +113,9 @@ def send_time_sync(ser):
     lt = time.localtime()
     payload = struct.pack(TIME_SYNC_FMT, lt.tm_wday, lt.tm_hour, lt.tm_min, lt.tm_sec)
     ser.write(build_frame(MSG_TIME_SYNC, payload))
+    # The date goes in its own message right after (older dash firmware
+    # ignores it); same localtime() reading, so the two always agree.
+    ser.write(build_frame(MSG_DATE_SYNC, struct.pack(DATE_SYNC_FMT, lt.tm_mday, lt.tm_mon, lt.tm_year)))
 
 
 def send_time_sync_burst(ser, stop_event, count=3, gap_s=0.3):

@@ -105,7 +105,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.3.1"
+VOLGAS_VERSION = "0.3.2"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -570,6 +570,7 @@ DASH_PREVIEW_MS = 50            # the bridge sends at 20 Hz
 DASH_WHITE, DASH_GREEN, DASH_RED, DASH_YELLOW = (255, 255, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)
 DASH_UNKNOWN = (110, 110, 110)
 DASH_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+DASH_MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 def _dash_text(draw, x, y, text, size, color):
@@ -593,7 +594,8 @@ def _render_dash(state):
     """The dash's 128x128 screen as an RGB image. state is
     ("classic", (speed_kph, rpm, rpm_max, gear), lap or None, delta or None)
     with lap = (lap_time_ms, valid) / delta = (delta_ms, valid), or
-    ("standby", has_time, app_connected, (weekday, hour, minute))."""
+    ("standby", has_time, app_connected, (weekday, hour, minute, day, month),
+    hub_lost)."""
     img = Image.new("RGB", (DASH_SIZE, DASH_SIZE))
     draw = ImageDraw.Draw(img)
     mid = DASH_SIZE // 2
@@ -624,20 +626,25 @@ def _render_dash(state):
                            DASH_GREEN if delta_ms <= 0 else DASH_RED)
         return img
 
-    _, has_time, app_connected, now = state
-    top = (DASH_SIZE - (88 if has_time else 42)) // 2
+    # The clock (time and day/date) is centred on its own; the hub and app
+    # lines are only there while there's a problem, in fixed slots below it
+    # (esp32_dash.ino's standby screen).
+    _, has_time, app_connected, now, hub_lost = state
+    top = (DASH_SIZE - (40 if has_time else 42)) // 2
     if has_time:
-        weekday, hour, minute = now
+        weekday, hour, minute, mday, month = now
         clock = f"{hour:02d}:{minute:02d}"
         _dash_text(draw, (DASH_SIZE - len(clock) * 18) // 2, top + 2, clock, 3, DASH_WHITE)
-        day = DASH_DAY_NAMES[weekday % 7]
+        day = f"{DASH_DAY_NAMES[weekday % 7]} {mday} {DASH_MONTH_NAMES[(month - 1) % 12]}"
         _dash_text(draw, (DASH_SIZE - len(day) * 6) // 2, top + 30, day, 1, DASH_WHITE)
-    wheel_x, wheel_y = (DASH_SIZE - len("wheel: --") * 6) // 2, top + (46 if has_time else 0)
-    _dash_text(draw, wheel_x, wheel_y, "wheel: ", 1, DASH_WHITE)
-    _dash_text(draw, wheel_x + 7 * 6, wheel_y, "--", 1, DASH_UNKNOWN)
+    hub_y = top + (44 if has_time else 0)
+    app_y = top + (56 if has_time else 16)
+    if hub_lost:
+        _dash_text(draw, (DASH_SIZE - len("hub: lost") * 6) // 2, hub_y, "hub: ", 1, DASH_WHITE)
+        _dash_text(draw, (DASH_SIZE - len("hub: lost") * 6) // 2 + 5 * 6, hub_y, "lost", 1, DASH_RED)
     if not app_connected:
         text = "app: disconnected"
-        _dash_text(draw, (DASH_SIZE - len(text) * 6) // 2, top + (62 if has_time else 16), text, 1, DASH_RED)
+        _dash_text(draw, (DASH_SIZE - len(text) * 6) // 2, app_y, text, 1, DASH_RED)
     return img
 
 
@@ -2290,7 +2297,7 @@ class VolgasApp:
     def _dash_preview_state(self):
         bridge, now = self._dash_bridge, time.monotonic()
         if bridge is None or not bridge.connected:
-            return ("standby", False, False, None)
+            return ("standby", False, False, None, False)
         tel = bridge.last_telemetry
         if tel and now - tel[0] < DASH_TELEMETRY_TIMEOUT_S:
             lap, delta = bridge.last_lap_time, bridge.last_lap_delta
@@ -2298,7 +2305,9 @@ class VolgasApp:
             return ("classic", tel[1], lap[1] if footer else None,
                     delta[1] if footer and delta else None)
         t = time.localtime()
-        return ("standby", bridge.time_synced, True, (t.tm_wday, t.tm_hour, t.tm_min))
+        hub_lost = bridge.is_hub and not bridge.hub_status[1]["linked"]
+        return ("standby", bridge.time_synced, True, (t.tm_wday, t.tm_hour, t.tm_min, t.tm_mday, t.tm_mon),
+                bool(hub_lost))
 
     def _dash_preview_poll(self):
         if self._tab_frames["Dash"].winfo_ismapped():
@@ -3229,7 +3238,7 @@ class VolgasApp:
         versions = {key: None for key in devs.DEVICES}
         bridge = self._dash_bridge
         if bridge is not None and bridge.is_hub and bridge.hub_status[1]["linked"]:
-            versions["dash"] = bridge.hub_status[1]["fw"] or None
+            versions["dash"] = devs.format_wheel_version(bridge.hub_status[1]["fw"])
         if self.wb_connected:
             versions["wheelbase"] = self._wb_fw
         return versions
@@ -3324,7 +3333,8 @@ class VolgasApp:
                 elif kind == "done":       # (done, old, new)
                     self._dev_update_busy = False
                     self._dev_text.pop("dash", None)
-                    self._notify(f"Dash updated: firmware {msg[1]} to {msg[2]}.", "info")
+                    self._notify(f"Dash updated: firmware {devs.format_wheel_version(msg[1])} to "
+                                 f"{devs.format_wheel_version(msg[2])}.", "info")
                 elif kind == "failed":     # (failed, text)
                     self._dev_update_busy = False
                     self._dev_text.pop("dash", None)

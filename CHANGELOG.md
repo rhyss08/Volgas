@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2 (2026-11-13)
+
+### Dash
+- The standby clock shows the date next to the day ("Friday 13 Nov"). Volgas sends the date with the time; older dash firmware ignores it. Needs dash firmware 5.1, which is attached to this release: install it from Settings -> Device updates.
+- Dash firmware versions can now have a minor part (5.1); Volgas shows them that way.
+- The dash preview in the app matches the real standby screen: the clock is centred and "hub: lost" shows only while the link is down.
+
 ## 0.3.1 (2026-11-13)
 
 ### Interface

@@ -22,6 +22,8 @@ import time
 import serial
 import serial.tools.list_ports
 
+from volgas_devices import format_wheel_version as fw_text
+
 ESP32_VID, ESP32_PID = 0x303A, 0x1001
 SYNC0, SYNC1 = 0xAA, 0x55
 USB_OTA_BEGIN, USB_OTA_DATA, USB_OTA_END, USB_OTA_ABORT = 0x40, 0x41, 0x42, 0x43
@@ -139,7 +141,7 @@ def update_wheel(image, port=None, progress=lambda done, total: None, log=print)
         if not status or not status["linked"]:
             raise OtaError("the hub doesn't hear the wheel - power it and check it shows 'hub: ok'")
         old_fw = status["fw"]
-        log(f"hub on {port}; wheel firmware {old_fw}, signal {status['rssi']} dBm")
+        log(f"hub on {port}; wheel firmware {fw_text(old_fw)}, signal {status['rssi']} dBm")
 
         md5 = hashlib.md5(image).hexdigest().encode("ascii")
         st, _ = hub.ota(USB_OTA_BEGIN, struct.pack("<I", len(image)) + md5, timeout=1.0, tries=5)
@@ -175,11 +177,11 @@ def update_wheel(image, port=None, progress=lambda done, total: None, log=print)
             if s and s["linked"]:
                 last = s
                 if s["fw"] != old_fw:
-                    log(f"the wheel is back on firmware {s['fw']}")
+                    log(f"the wheel is back on firmware {fw_text(s['fw'])}")
                     return old_fw, s["fw"]
             time.sleep(1)
         if last is not None:
-            raise OtaError(f"the wheel restarted but is still on firmware {last['fw']}: the file has the same "
+            raise OtaError(f"the wheel restarted but is still on firmware {fw_text(last['fw'])}: the file has the same "
                            "version number as the one already installed")
         raise OtaError("the wheel didn't come back on the new firmware (it may have gone back to the old one)")
     except Exception:
@@ -203,7 +205,7 @@ def main():
         old, new = update_wheel(image, args.port)
     except (OtaError, serial.SerialException) as e:
         sys.exit(f"update failed: {e}")
-    print(f"done: firmware {old} -> {new}")
+    print(f"done: firmware {fw_text(old)} -> {fw_text(new)}")
 
 
 if __name__ == "__main__":

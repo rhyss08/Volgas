@@ -32,6 +32,15 @@ MANIFEST_ASSET = "firmware.json"
 CURRENT, UPDATE, NEWER, UNKNOWN = "current", "update", "newer", "unknown"
 
 
+def format_wheel_version(raw):
+    """The dash/wheel firmware's 16-bit version as text: below 256 a plain
+    number (releases 1-5), otherwise major << 8 | minor (0x0501 = "5.1").
+    None for 0 (not reported)."""
+    if not raw:
+        return None
+    return str(raw) if raw < 256 else f"{raw >> 8}.{raw & 255}"
+
+
 def version_tuple(version):
     """Comparable form of a firmware version: 3, "3", "26.1.1" -> tuples of
     ints. None if there's nothing numeric to compare."""
