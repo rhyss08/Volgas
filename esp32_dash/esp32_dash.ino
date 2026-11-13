@@ -1,32 +1,37 @@
 #include <SPI.h>
-#include <RF24.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_ota_ops.h>
+#include <Update.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include "USB.h"
 #include "USBCDC.h"
-#include "USBHIDGamepad.h"
 #include "esp32_dash_protocol.h"
+#include "volgas_link.h"
 #include "volgas_logo.h"
 
 // ==========================================
-//   ESP32-S3 DASH (2026-07-16)
+//   ESP32-S3 WHEEL (dash + buttons, 2026-11-13)
 // ==========================================
-// Receives wheel button packets wirelessly over nRF24 - same "WHEEL" pipe
-// address and packet format wheel_tx.ino already used when it was
-// transmitting to the pedals' Blue Pill. Only the receiver moved: the
-// Blue Pill no longer touches the wheel's wireless link at all.
+// This S3 Mini lives on the wheel (power through the slip ring) and talks
+// to the hub (hub_s3) over ESP-NOW - see volgas_link.h:
+//   - dash data: Volgas -> hub over USB -> here by radio, fed into the same
+//     frame parser as this board's own USB port (which still works, so the
+//     dash can also run straight off USB, as it did before the hub);
+//   - buttons: 12 in a diode matrix (see BUTTONS below), sent to the hub,
+//     which is the game controller the PC sees.
+// It used to be the dash on the PC's USB with the Nano wheel's buttons
+// coming in over nRF24 and going out as its own USB gamepad; that radio and
+// the gamepad are gone.
 //
-// Reports the 12 buttons as this board's OWN separate USB HID gamepad
-// (not merged into the Pedal Set's device) - bind both devices together
-// in-game, same pattern already normal for DIY rigs with a wheelbase +
-// pedals as separate USB devices.
-//
-// Also drives the ST7735 display: a Volgas boot splash, then a Standby
-// screen (day/time from the PC + wheel link status) whenever no telemetry
-// is actively arriving, switching to the live Classic screen (gear/speed/
-// RPM bar) while it is - see esp32_dash_protocol.h and pollTelemetry().
-// Telemetry going quiet for a bit (TELEMETRY_TIMEOUT_MS) drops back to
-// Standby automatically, rather than freezing on the last frame.
+// The ST7735 shows a Volgas boot splash, then a Standby screen (day/time
+// from the PC + hub link status) whenever no telemetry is actively arriving,
+// switching to the live Classic screen (gear/speed/RPM bar) while it is -
+// see esp32_dash_protocol.h and DashParser. Telemetry going quiet for a bit
+// (TELEMETRY_TIMEOUT_MS) drops back to Standby automatically, rather than
+// freezing on the last frame.
 //
 // CDC is composited EXPLICITLY here (our own `USBCDC USBSerial` global
 // below) - do NOT set CDCOnBoot=cdc; keep the board menu / FQBN at its
@@ -48,30 +53,34 @@
 // (UART0 pins) in this configuration - useless over the USB cable; all
 // USB serial I/O here uses USBSerial explicitly.
 
-// nRF24L01 and the display are on FULLY SEPARATE SPI peripherals (FSPI
-// and HSPI respectively) - unlike the Nano/Blue Pill, which only had one
-// hardware SPI each and had to share it via separate CS/CE lines, the
-// ESP32-S3 has two independent general-purpose SPI controllers, both
-// freely remappable to any GPIO. No bus-sharing arbitration to reason
-// about at all; each device's SCK/MOSI/MISO are genuinely its own.
-
-// nRF24L01 wiring (own bus, FSPI):
-//   VCC -> 3.3V (NOT 5V - kills the module), GND -> GND
-//   CE   -> GPIO4
-//   CSN  -> GPIO5
-//   SCK  -> GPIO6
-//   MISO -> GPIO7
-//   MOSI -> GPIO13  (kept within GPIO1-13 - GPIO15 was hard to physically
-//                     access on this board's header)
-#define NRF_CE   4
-#define NRF_CSN  5
-#define NRF_SCK  6
-#define NRF_MISO 7
-#define NRF_MOSI 13
+// ==========================================
+//   BUTTONS (4x3 matrix, not wired yet as of 2026-11-13)
+// ==========================================
+// 12 buttons in 4 rows x 3 columns on free pins (GPIO7 is the display
+// backlight):
+//   rows    -> GPIO4, GPIO5, GPIO6, GPIO1
+//   columns -> GPIO13, GPIO2, GPIO3
+// Each button connects its row to its column through a diode (e.g. 1N4148),
+// band (cathode) towards the ROW - without diodes, holding three buttons
+// that form a rectangle makes a fourth look pressed.
+// Numbering: button = row * 3 + column + 1, so row 0 is buttons 1-3, row 1
+// is 4-6 ... row 3 is 10-12 (columns in the order listed above).
+// Scanning: one row at a time is driven LOW (the others float), and the
+// columns, pulled up inside the chip, read LOW where a button is held.
+const uint8_t ROW_PINS[] = {4, 5, 6, 1};
+const uint8_t COL_PINS[] = {13, 2, 3};
+#define ROW_COUNT (sizeof(ROW_PINS) / sizeof(ROW_PINS[0]))
+#define COL_COUNT (sizeof(COL_PINS) / sizeof(COL_PINS[0]))
+#define BUTTON_COUNT (ROW_COUNT * COL_COUNT)
+#define BUTTON_DEBOUNCE_READS 3   // a change counts once it reads the same this many loops in a row (~6 ms)
 
 // ST7735 display wiring (own bus, HSPI/default global SPI):
-//   VCC/LED -> 3.3V, GND -> GND
+//   VCC -> 3.3V, GND -> GND, LED (backlight) -> GPIO7
 //   SCK -> GPIO12, MOSI/SDA -> GPIO11, CS -> GPIO10, DC -> GPIO8, RST -> GPIO9
+// The backlight used to be on 3.3V, so it lit the moment the board got power
+// and showed the panel's white "not set up yet" screen until the firmware
+// had initialised it. Now it stays off until the boot logo is on the
+// screen (showSplashScreen). The module's own resistor limits the current.
 // Matches the pin plan already decided before this board arrived (see
 // CLAUDE.md's original dash section) - unchanged since the display was
 // never the half of this that needed separating.
@@ -80,6 +89,7 @@
 #define TFT_CS   10
 #define TFT_DC   8
 #define TFT_RST  9
+#define TFT_LED  7
 
 // GPIOs to avoid on this chip (already learned the hard way on other
 // boards in this project - see CLAUDE.md toolchain gotchas): GPIO0 (boot
@@ -88,24 +98,12 @@
 // "ESP32-S3 Mini" board before wiring - generic "S3 Mini" covers several
 // different vendor boards with different physical pin breakouts.
 
-// 4MHz, not RF24's 10MHz default - cheap clone nRF24L01 modules on
-// breadboard wiring often can't sustain 10MHz reliably (radio.begin()
-// fails chip detection consistently). Already confirmed as the fix for
-// this exact symptom on the pedals' Blue Pill - applying it here
-// preemptively instead of waiting to hit the same issue a third time.
-RF24 radio(NRF_CE, NRF_CSN, 4000000);
-SPIClass radioSPI(FSPI);   // the nRF24's own independent SPI bus - see wiring notes above
-const byte wheelAddress[6] = "WHEEL";
-bool radioOk = false;
-uint16_t wheelButtons = 0;
-unsigned long lastRadioPacket = 0;
-const unsigned long RADIO_TIMEOUT_MS = 500;   // matches wheel_tx.ino's heartbeat cadence
-bool wheelLinkOk = false;   // for the Standby screen - distinct from wheelButtons, which is legitimately 0 both when idle and when disconnected
+uint32_t wheelButtons = 0;   // debounced, bit N = button N+1
+bool hubLinkOk = false;      // for the Standby screen
 
 enum DashScreen { SCREEN_STANDBY, SCREEN_CLASSIC };
 DashScreen currentScreen = SCREEN_STANDBY;
 
-USBHIDGamepad Gamepad;
 USBCDC USBSerial;   // explicit CDC interface - see header comment; constructor registers it with TinyUSB
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
@@ -124,6 +122,7 @@ void showSplashScreen() {
   // adding another pair around this call double-begins the transaction and
   // hangs the bus - that's what produced a fully black display 2026-07-25.
   tft.drawRGBBitmap((SCREEN_W - VOLGAS_LOGO_W) / 2, (SCREEN_H - VOLGAS_LOGO_H) / 2, volgas_logo, VOLGAS_LOGO_W, VOLGAS_LOGO_H);
+  digitalWrite(TFT_LED, HIGH);   // backlight on: the first thing shown is the logo
   delay(3000);
 }
 
@@ -459,7 +458,7 @@ int16_t standbyLastDay = -1;
 int8_t  standbyLastWheelOk = -1;      // -1 = never drawn, 0 = lost, 1 = ok
 int8_t  standbyLastAppConnected = -1; // -1 = never drawn, 0 = disconnected, 1 = connected
 bool    standbyLastHasTime = false;
-uint16_t standbyLastButtons = 0xFFFF; // sentinel - forces first draw
+uint32_t standbyLastButtons = 0xFFFFFFFF; // sentinel - forces first draw
 
 void standbyScreenInit() {
   tft.fillScreen(ST7735_BLACK);
@@ -467,7 +466,7 @@ void standbyScreenInit() {
   standbyLastDay = -1;
   standbyLastWheelOk = -1;
   standbyLastAppConnected = -1;
-  standbyLastButtons = 0xFFFF;
+  standbyLastButtons = 0xFFFFFFFF;
   standbyLastHasTime = false;   // forces the first update to lay out for whatever hasTimeSync currently is
 }
 
@@ -478,10 +477,14 @@ void standbyScreenInit() {
 // whole block (time+day+wheel+app) centering together whenever time is shown.
 const int16_t STANDBY_TIME_OFFSET              = 0;
 const int16_t STANDBY_DAY_OFFSET               = 30;
-const int16_t STANDBY_WHEEL_OFFSET_WITH_TIME   = 46;
-const int16_t STANDBY_APP_OFFSET_WITH_TIME     = 62;
-const int16_t STANDBY_BUTTON_OFFSET_WITH_TIME  = 78;
-const int16_t STANDBY_BLOCK_HEIGHT_WITH_TIME   = 88;   // last row's bottom edge relative to the block top
+// With the clock shown, only the time and day are centred (block height 40:
+// they stay in the middle of the screen whatever the status rows below do);
+// the hub / app / button rows sit in fixed slots under them (y = 88, 100,
+// 112), and are blank unless there's something to say.
+const int16_t STANDBY_WHEEL_OFFSET_WITH_TIME   = 44;
+const int16_t STANDBY_APP_OFFSET_WITH_TIME     = 56;
+const int16_t STANDBY_BUTTON_OFFSET_WITH_TIME  = 68;
+const int16_t STANDBY_BLOCK_HEIGHT_WITH_TIME   = 40;
 
 const int16_t STANDBY_WHEEL_OFFSET_NO_TIME  = 0;
 const int16_t STANDBY_APP_OFFSET_NO_TIME    = 16;
@@ -516,17 +519,20 @@ void standbyDrawTime(uint8_t dayOfWeek, uint8_t hour, uint8_t minute) {
   tft.print(day);
 }
 
-void standbyDrawWheelStatus(bool wheelOk) {
+// The radio link to the hub (the row kept its old "wheel" position names).
+// Only shown while the link is down - blank (just cleared) when it's fine,
+// like the app status line below.
+void standbyDrawWheelStatus(bool linkOk) {
   int16_t y = standbyBlockTop() + (hasTimeSync ? STANDBY_WHEEL_OFFSET_WITH_TIME : STANDBY_WHEEL_OFFSET_NO_TIME);
-  char buf[16];
-  snprintf(buf, sizeof(buf), "wheel: %s", wheelOk ? "ok" : "lost");
-  int16_t x = (SCREEN_W - (int16_t)strlen(buf) * 6) / 2;
   tft.fillRect(0, y, SCREEN_W, 10, ST7735_BLACK);
+  if (linkOk) return;
+  const char* buf = "hub: lost";
+  int16_t x = (SCREEN_W - (int16_t)strlen(buf) * 6) / 2;
   tft.setCursor(x, y);
   tft.setTextColor(ST7735_WHITE);
-  tft.print("wheel: ");
-  tft.setTextColor(wheelOk ? ST7735_GREEN : ST7735_RED);
-  tft.print(wheelOk ? "ok" : "lost");
+  tft.print("hub: ");
+  tft.setTextColor(ST7735_RED);
+  tft.print("lost");
 }
 
 void standbyDrawAppStatus(bool connected) {
@@ -540,13 +546,10 @@ void standbyDrawAppStatus(bool connected) {
   tft.print(buf);
 }
 
-// Shows which wheel button(s) are currently held, for testing/confirming
-// the wireless link without needing a game running (2026-07-25) - blank
-// when nothing's pressed, same "only show when there's something to say"
-// idiom as the app status line above. wheelButtons is read directly (own
-// global, set from the nRF24 packets - this board IS the wheel's receiver,
-// see the radio section) rather than passed in as a parameter.
-void standbyDrawButtons(uint16_t buttons) {
+// Shows which button(s) are currently held, for testing the wiring without
+// needing a game running - blank when nothing's pressed, same "only show
+// when there's something to say" idiom as the app status line above.
+void standbyDrawButtons(uint32_t buttons) {
   int16_t y = standbyBlockTop() + (hasTimeSync ? STANDBY_BUTTON_OFFSET_WITH_TIME : STANDBY_BUTTON_OFFSET_NO_TIME);
   tft.fillRect(0, y, SCREEN_W, 10, ST7735_BLACK);
   if (buttons == 0) return;   // blank when nothing's pressed
@@ -554,7 +557,7 @@ void standbyDrawButtons(uint16_t buttons) {
   char buf[40] = "btn: ";
   size_t len = strlen(buf);
   bool first = true;
-  for (uint8_t bit = 0; bit < 12 && len < sizeof(buf) - 4; bit++) {
+  for (uint8_t bit = 0; bit < BUTTON_COUNT && len < sizeof(buf) - 4; bit++) {
     if (!(buttons & (1u << bit))) continue;
     if (!first) buf[len++] = ',';
     len += snprintf(buf + len, sizeof(buf) - len, "%u", bit + 1);   // bit N = button N+1
@@ -576,7 +579,7 @@ void standbyScreenUpdate(bool wheelOk) {
     standbyLastDay = -1;
     standbyLastWheelOk = -1;
     standbyLastAppConnected = -1;
-    standbyLastButtons = 0xFFFF;
+    standbyLastButtons = 0xFFFFFFFF;
   }
 
   if (hasTimeSync) {
@@ -617,16 +620,54 @@ DashTelemetry latestTelemetry = {0, 0, 0, 0};
 unsigned long lastTelemetryMs = 0;
 const unsigned long TELEMETRY_TIMEOUT_MS = 1000;   // bridge sends at 20Hz - 1s of silence means the game/bridge stopped
 
-void pollTelemetry() {
-  static enum { WAIT_SYNC0, WAIT_SYNC1, READ_TYPE, READ_LEN, READ_PAYLOAD, READ_CHECKSUM } state = WAIT_SYNC0;
-  static uint8_t msgType, msgLen, payloadIdx, checksum;
-  static uint8_t payload[DASH_MAX_PAYLOAD];
-  static unsigned long lastByteMs = 0;
+void handleDashMessage(uint8_t msgType, const uint8_t* payload, uint8_t msgLen) {
+  if (msgType == MSG_DASH_TELEMETRY && msgLen == sizeof(DashTelemetry)) {
+    lastTelemetryMs = millis();
+    memcpy(&latestTelemetry, payload, sizeof(DashTelemetry));
+    if (currentScreen != SCREEN_CLASSIC) {
+      currentScreen = SCREEN_CLASSIC;
+      classicScreenInit();
+    }
+    classicScreenUpdate(latestTelemetry);
+  } else if (msgType == MSG_TIME_SYNC && msgLen == sizeof(TimeSync)) {
+    TimeSync ts;
+    memcpy(&ts, payload, sizeof(TimeSync));
+    syncedDayOfWeek = ts.dayOfWeek;
+    syncedHour = ts.hour;
+    syncedMinute = ts.minute;
+    syncedSecond = ts.second;
+    hasTimeSync = true;   // one-way latch - see STANDBY SCREEN section
+    lastTimeSyncMs = millis();
+  } else if (msgType == MSG_LAP_TIME && msgLen == sizeof(LapTime)) {
+    LapTime lt;
+    memcpy(&lt, payload, sizeof(LapTime));
+    currentLapTimeMs = lt.lapTimeMs;
+    currentLapTimeValid = lt.valid != 0;
+    lastLapTimeMsgMs = millis();
+    if (currentScreen == SCREEN_CLASSIC) {
+      if (!footerActive) setFooterActive(true);
+      footerDrawLapTime(currentLapTimeMs, currentLapTimeValid);
+    }
+  } else if (msgType == MSG_LAP_DELTA && msgLen == sizeof(LapDelta)) {
+    LapDelta ld;
+    memcpy(&ld, payload, sizeof(LapDelta));
+    if (currentScreen == SCREEN_CLASSIC) {
+      footerDrawDelta(ld.cumulativeDeltaMs, ld.valid != 0);
+    }
+  }
+}
 
-  if (state != WAIT_SYNC0 && millis() - lastByteMs > 100) state = WAIT_SYNC0;
+// One frame parser per byte source (this board's USB port, and the hub's
+// radio packets), so bytes from one can never land in the middle of a frame
+// from the other.
+struct DashParser {
+  enum { WAIT_SYNC0, WAIT_SYNC1, READ_TYPE, READ_LEN, READ_PAYLOAD, READ_CHECKSUM } state = WAIT_SYNC0;
+  uint8_t msgType = 0, msgLen = 0, payloadIdx = 0, checksum = 0;
+  uint8_t payload[DASH_MAX_PAYLOAD];
+  unsigned long lastByteMs = 0;
 
-  while (USBSerial.available()) {
-    uint8_t b = USBSerial.read();
+  void feed(uint8_t b) {
+    if (state != WAIT_SYNC0 && millis() - lastByteMs > 100) state = WAIT_SYNC0;
     lastByteMs = millis();
     switch (state) {
       case WAIT_SYNC0:
@@ -653,53 +694,285 @@ void pollTelemetry() {
         if (payloadIdx >= msgLen) state = READ_CHECKSUM;
         break;
       case READ_CHECKSUM:
-        if (b == checksum && msgType == MSG_DASH_TELEMETRY && msgLen == sizeof(DashTelemetry)) {
-          lastTelemetryMs = millis();
-          memcpy(&latestTelemetry, payload, sizeof(DashTelemetry));
-          if (currentScreen != SCREEN_CLASSIC) {
-            currentScreen = SCREEN_CLASSIC;
-            classicScreenInit();
-          }
-          classicScreenUpdate(latestTelemetry);
-        } else if (b == checksum && msgType == MSG_TIME_SYNC && msgLen == sizeof(TimeSync)) {
-          TimeSync ts;
-          memcpy(&ts, payload, sizeof(TimeSync));
-          syncedDayOfWeek = ts.dayOfWeek;
-          syncedHour = ts.hour;
-          syncedMinute = ts.minute;
-          syncedSecond = ts.second;
-          hasTimeSync = true;   // one-way latch - see STANDBY SCREEN section
-          lastTimeSyncMs = millis();
-        } else if (b == checksum && msgType == MSG_LAP_TIME && msgLen == sizeof(LapTime)) {
-          LapTime lt;
-          memcpy(&lt, payload, sizeof(LapTime));
-          currentLapTimeMs = lt.lapTimeMs;
-          currentLapTimeValid = lt.valid != 0;
-          lastLapTimeMsgMs = millis();
-          if (currentScreen == SCREEN_CLASSIC) {
-            if (!footerActive) setFooterActive(true);
-            footerDrawLapTime(currentLapTimeMs, currentLapTimeValid);
-          }
-        } else if (b == checksum && msgType == MSG_LAP_DELTA && msgLen == sizeof(LapDelta)) {
-          LapDelta ld;
-          memcpy(&ld, payload, sizeof(LapDelta));
-          if (currentScreen == SCREEN_CLASSIC) {
-            footerDrawDelta(ld.cumulativeDeltaMs, ld.valid != 0);
-          }
-        }
+        if (b == checksum) handleDashMessage(msgType, payload, msgLen);
         state = WAIT_SYNC0;
         break;
     }
   }
+};
+
+DashParser usbParser, radioParser;
+
+void pollTelemetry() {
+  while (USBSerial.available()) usbParser.feed(USBSerial.read());
+}
+
+// ==========================================
+//   RADIO LINK TO THE HUB (see volgas_link.h)
+// ==========================================
+const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+const uint16_t WHEEL_FW_VERSION = 5;   // bump for every release - the hub and Volgas show it (1 = first radio link, 2 = wireless updates, 3 = backlight on GPIO7, 4 = hub status only shown when lost, 5 = clock centred)
+
+struct RxPacket {
+  uint8_t mac[6];
+  uint8_t len;
+  uint8_t data[250];
+};
+QueueHandle_t rxQueue;
+
+uint8_t hubMac[6];
+bool hubKnown = false;
+unsigned long lastHubMs = 0;
+
+// Runs in the Wi-Fi task: only copy the packet out; loop() does the work
+// (the display must only ever be touched from one task).
+void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (!linkValid(data, len) || len > 250) return;
+  RxPacket p;
+  memcpy(p.mac, info->src_addr, 6);
+  p.len = len;
+  memcpy(p.data, data, len);
+  xQueueSend(rxQueue, &p, 0);
+}
+
+void ensurePeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = LINK_CHANNEL;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+void linkBegin() {
+  rxQueue = xQueueCreate(16, sizeof(RxPacket));
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(LINK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) {
+    USBSerial.println("BOOT: ESP-NOW failed to start");
+    return;
+  }
+  esp_now_register_recv_cb(onReceive);
+  ensurePeer(BROADCAST);
+  USBSerial.printf("BOOT: radio up, %s on channel %d\n", WiFi.macAddress().c_str(), LINK_CHANNEL);
+}
+
+// ==========================================
+//   WIRELESS FIRMWARE UPDATE (see volgas_link.h)
+// ==========================================
+// Chunks arrive in order through the hub and go straight into the spare
+// firmware slot (Update writes the OTA partition that isn't running). Every
+// packet is answered with the next offset wanted, so the sender just resends
+// whatever didn't arrive. Refused while the car is moving.
+//
+// Probation: the core is told (verifyRollbackLater) not to accept a new
+// firmware on its own. After an update the wheel boots it as "pending";
+// it's kept once it links to the hub, and if it crashes, or can't reach the
+// hub within OTA_PROBATION_MS, the bootloader goes back to the previous one.
+// Firmware flashed over USB isn't pending, so none of this applies to it.
+extern "C" bool verifyRollbackLater() { return true; }
+
+const unsigned long OTA_PROBATION_MS = 60000;
+bool otaActive = false;
+uint32_t otaSize = 0, otaNext = 0;
+int8_t otaShownPercent = -1;
+bool otaPendingVerify = false;
+
+void otaReply(uint8_t status) {
+  LinkOtaAck a = {linkHeader(LINK_OTA_ACK), status, otaNext};
+  esp_now_send(hubMac, (const uint8_t*)&a, sizeof(a));
+}
+
+void otaDrawProgress(const char* line1, int percent) {
+  tft.fillScreen(ST7735_BLACK);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setTextSize(1);
+  tft.setCursor((SCREEN_W - (int16_t)strlen(line1) * 6) / 2, 44);
+  tft.print(line1);
+  if (percent >= 0) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", percent);
+    tft.setTextSize(3);
+    tft.setCursor((SCREEN_W - (int16_t)strlen(buf) * 18) / 2, 62);
+    tft.print(buf);
+  }
+}
+
+bool carMoving() {
+  return millis() - lastTelemetryMs < 2000 && latestTelemetry.speedKph > 2;
+}
+
+void otaHandle(const uint8_t* data, int len) {
+  const LinkHeader* h = (const LinkHeader*)data;
+  if (h->type == LINK_OTA_BEGIN && len >= (int)sizeof(LinkOtaBegin)) {
+    const LinkOtaBegin* b = (const LinkOtaBegin*)data;
+    if (otaActive && b->size == otaSize) { otaReply(OTA_OK); return; }   // our answer got lost
+    if (carMoving()) { otaReply(OTA_DRIVING); return; }
+    if (otaActive) Update.abort();
+    otaNext = 0;
+    char md5[33];
+    memcpy(md5, b->md5, 32);
+    md5[32] = 0;
+    otaActive = Update.begin(b->size) && Update.setMD5(md5);
+    if (!otaActive) { Update.abort(); otaReply(OTA_BEGIN_FAILED); return; }
+    otaSize = b->size;
+    otaShownPercent = 0;
+    currentScreen = SCREEN_STANDBY;   // back to standby once it's over
+    otaDrawProgress("Updating firmware", 0);
+    otaReply(OTA_OK);
+  } else if (h->type == LINK_OTA_DATA && len >= (int)sizeof(LinkHeader) + 5) {
+    if (!otaActive) { otaReply(OTA_NOT_STARTED); return; }
+    const LinkOtaData* d = (const LinkOtaData*)data;
+    uint8_t n = min((int)d->len, len - (int)sizeof(LinkHeader) - 5);
+    if (d->offset == otaNext && n > 0) {
+      if (Update.write((uint8_t*)d->data, n) != n) {
+        Update.abort();
+        otaActive = false;
+        otaReply(OTA_WRITE_FAILED);
+        return;
+      }
+      otaNext += n;
+      int percent = (int)((uint64_t)otaNext * 100 / otaSize);
+      if (percent / 5 != otaShownPercent / 5) {
+        otaShownPercent = percent;
+        otaDrawProgress("Updating firmware", percent);
+      }
+    }
+    otaReply(OTA_OK);   // a repeat or an out-of-order chunk just gets told where to continue
+  } else if (h->type == LINK_OTA_END) {
+    if (!otaActive) { otaReply(Update.isFinished() ? OTA_DONE : OTA_NOT_STARTED); return; }
+    otaActive = false;
+    if (otaNext != otaSize || !Update.end()) {
+      USBSerial.printf("OTA: verify failed (%s)\n", Update.errorString());
+      Update.abort();
+      otaReply(OTA_VERIFY_FAILED);
+      otaDrawProgress("Update failed", -1);
+      delay(1500);
+      standbyScreenInit();
+      return;
+    }
+    otaReply(OTA_DONE);
+    otaDrawProgress("Update done", 100);
+    delay(500);   // let the answer go out
+    ESP.restart();
+  } else if (h->type == LINK_OTA_ABORT) {
+    if (otaActive) Update.abort();
+    otaActive = false;
+    otaReply(OTA_OK);
+    standbyScreenInit();
+  }
+}
+
+void otaProbationBegin() {
+  esp_ota_img_states_t state;
+  otaPendingVerify = esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+                     state == ESP_OTA_IMG_PENDING_VERIFY;
+  if (otaPendingVerify) USBSerial.println("BOOT: new firmware on probation until the hub link is up");
+}
+
+void otaProbationService() {
+  if (!otaPendingVerify) return;
+  if (hubLinkOk) {
+    esp_ota_mark_app_valid_cancel_rollback();
+    otaPendingVerify = false;
+  } else if (millis() > OTA_PROBATION_MS) {
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+  }
+}
+
+void linkService() {
+  unsigned long now = millis();
+  RxPacket p;
+  while (xQueueReceive(rxQueue, &p, 0) == pdTRUE) {
+    const LinkHeader* h = (const LinkHeader*)p.data;
+    bool fromHub = h->type == LINK_HELLO_ACK || h->type == LINK_DASH || h->type == LINK_HEARTBEAT ||
+                   (h->type >= LINK_OTA_BEGIN && h->type <= LINK_OTA_ABORT);
+    if (!fromHub) continue;
+    if (!hubKnown || memcmp(p.mac, hubMac, 6) != 0) {
+      memcpy(hubMac, p.mac, 6);
+      hubKnown = true;
+      ensurePeer(hubMac);
+    }
+    lastHubMs = now;
+    if (h->type == LINK_DASH && p.len >= sizeof(LinkHeader) + 1 && !otaActive) {
+      const LinkDash* d = (const LinkDash*)p.data;
+      uint8_t n = min((int)d->len, p.len - (int)sizeof(LinkHeader) - 1);
+      for (uint8_t i = 0; i < n; i++) radioParser.feed(d->data[i]);
+    } else if (h->type >= LINK_OTA_BEGIN && h->type <= LINK_OTA_ABORT) {
+      otaHandle(p.data, p.len);
+    }
+  }
+  hubLinkOk = hubKnown && now - lastHubMs < LINK_HUB_TIMEOUT_MS;
+  if (otaActive && !hubLinkOk) {   // the hub went away mid-update
+    Update.abort();
+    otaActive = false;
+    standbyScreenInit();
+  }
+
+  // Until a hub answers (or after it goes quiet), say hello to anyone
+  // listening; once linked, repeat it to the hub now and then so it always
+  // knows this wheel's firmware version.
+  static unsigned long lastHelloMs = 0;
+  if (now - lastHelloMs >= (hubLinkOk ? LINK_HELLO_LINKED_MS : LINK_HELLO_MS)) {
+    LinkHello hello = {linkHeader(LINK_HELLO), LINK_DEVICE_WHEEL, 1, WHEEL_FW_VERSION, BUTTON_COUNT, LINK_CAP_DISPLAY};
+    esp_now_send(hubLinkOk ? hubMac : BROADCAST, (const uint8_t*)&hello, sizeof(hello));
+    lastHelloMs = now;
+  }
+
+  // Buttons: on every change, and repeated so a lost packet corrects itself.
+  static uint32_t sentButtons = 0xFFFFFFFF;
+  static unsigned long lastButtonsMs = 0;
+  static uint8_t seq = 0;
+  if (hubKnown && (wheelButtons != sentButtons || now - lastButtonsMs >= LINK_BUTTON_REPEAT_MS)) {
+    LinkButtons b = {linkHeader(LINK_BUTTONS), seq++, wheelButtons};
+    esp_now_send(hubMac, (const uint8_t*)&b, sizeof(b));
+    sentButtons = wheelButtons;
+    lastButtonsMs = now;
+  }
+}
+
+// ==========================================
+//   BUTTON READING (matrix, see BUTTONS above)
+// ==========================================
+void matrixBegin() {
+  for (uint8_t r = 0; r < ROW_COUNT; r++) pinMode(ROW_PINS[r], INPUT);   // floating until scanned
+  for (uint8_t c = 0; c < COL_COUNT; c++) pinMode(COL_PINS[c], INPUT_PULLUP);
+}
+
+uint32_t matrixScan() {
+  uint32_t pressed = 0;
+  for (uint8_t r = 0; r < ROW_COUNT; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], LOW);
+    delayMicroseconds(10);   // let the column lines settle through the pull-ups
+    for (uint8_t c = 0; c < COL_COUNT; c++) {
+      if (digitalRead(COL_PINS[c]) == LOW) pressed |= 1UL << (r * COL_COUNT + c);
+    }
+    pinMode(ROW_PINS[r], INPUT);
+  }
+  return pressed;
+}
+
+void readButtons() {
+  static uint32_t candidate = 0;
+  static uint8_t stableReads = 0;
+  uint32_t pins = matrixScan();
+  if (pins == candidate) {
+    if (stableReads < BUTTON_DEBOUNCE_READS) stableReads++;
+  } else {
+    candidate = pins;
+    stableReads = 1;
+  }
+  if (stableReads >= BUTTON_DEBOUNCE_READS) wheelButtons = candidate;
 }
 
 void setup() {
-  // Two fully independent SPI buses - the display uses the default global
-  // SPI object (HSPI), the nRF24 uses its own separate radioSPI (FSPI).
-  // Both must have begin() called with their own pins before the
-  // corresponding library uses them.
+  pinMode(TFT_LED, OUTPUT);
+  digitalWrite(TFT_LED, LOW);                // backlight off until the logo is drawn
   SPI.begin(TFT_SCK, -1, TFT_MOSI);          // display never uses MISO
-  radioSPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI);
+  matrixBegin();
 
   // Display proof-of-life BEFORE anything USB-related: the CDC-on-boot
   // build's cold-boot failure left a white (uninitialized) screen with no
@@ -714,24 +987,11 @@ void setup() {
   tft.setCursor(4, 4);
   tft.println("booting...");
 
-  radioOk = radio.begin(&radioSPI);
-  if (radioOk) {
-    radio.setPALevel(RF24_PA_LOW);
-    radio.setDataRate(RF24_250KBPS);
-    radio.openReadingPipe(1, wheelAddress);
-    radio.startListening();
-  }
-
-  // Without this it enumerates as a generic "HID-compliant game
-  // controller" - unhelpful once there's more than one controller bound
-  // in a game's device list. Must be set before USB.begin() - and with
-  // CDCOnBoot Disabled it finally CAN be: the CDC-on-boot build started
-  // USB in app_main() before setup(), so these calls never took effect
-  // (which is why Windows kept showing "ESP32S3 Dev" even on the build
-  // that had them compiled in).
+  // Must be set before USB.begin() - and with CDCOnBoot Disabled it CAN be:
+  // the CDC-on-boot build started USB in app_main() before setup(), so these
+  // calls never took effect.
   USB.manufacturerName("Sim Rig");
-  USB.productName("Dash Button Controller");
-  Gamepad.begin();
+  USB.productName("Volgas Wheel");
   USBSerial.begin(115200);
   // Already true by default (USBCDC's constructor), made explicit here since
   // a future PC companion app relies on it: opening this CDC port at 1200
@@ -739,8 +999,9 @@ void setup() {
   // rebooting the board into the ROM bootloader - no physical BOOT+RESET
   // needed. Confirmed working end-to-end 2026-07-25: touch at 1200 baud ->
   // board re-enumerates as the bootloader's USB-Serial/JTAG interface (same
-  // VID:PID 303A:1001, but MI_00 serial + MI_02 JTAG instead of this app's
-  // MI_00 HID + MI_01 CDC - that interface-layout difference is how a future
+  // VID:PID 303A:1001, but MI_00 serial + MI_02 JTAG instead of the app's
+  // own interfaces (HID + CDC until 2026-11-13, CDC only since the gamepad
+  // moved to the hub) - that interface-layout difference is how a future
   // app should tell "still the app" from "now the bootloader" apart) ->
   // esptool can flash new firmware there -> esptool's own hard reset at the
   // end boots straight back into the (new) app.
@@ -760,35 +1021,22 @@ void setup() {
   USBSerial.enableReboot(true);
   USB.begin();
 
-  USBSerial.println("BOOT: nRF24 " + String(radioOk ? "up, listening for wheel" : "not responding (check wiring)"));
+  linkBegin();
+  otaProbationBegin();
   showSplashScreen();
   standbyScreenInit();
-  standbyScreenUpdate(wheelLinkOk);
+  standbyScreenUpdate(hubLinkOk);
   USBSerial.println("BOOT: display ready, entering main loop");
 }
 
 void loop() {
-  if (radioOk) {
-    while (radio.available()) {
-      radio.read(&wheelButtons, sizeof(wheelButtons));
-      lastRadioPacket = millis();
-    }
-    bool linkTimedOut = millis() - lastRadioPacket > RADIO_TIMEOUT_MS;
-    if (linkTimedOut && wheelButtons != 0) {
-      wheelButtons = 0;   // link lost - release everything
-      USBSerial.println("wheel link lost - buttons released");
-    }
-    wheelLinkOk = !linkTimedOut;   // lastRadioPacket starts at 0, so this is false until the first real packet
+  readButtons();
+  linkService();
+  otaProbationService();
+  if (otaActive) {   // the update's progress screen owns the display
+    delay(1);
+    return;
   }
-
-  // Only send a HID report when something actually changed - matches the
-  // "don't spam the USB host" discipline used elsewhere in this project.
-  static uint16_t lastSentButtons = 0xFFFF;
-  if (wheelButtons != lastSentButtons) {
-    Gamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, (uint32_t)wheelButtons);
-    lastSentButtons = wheelButtons;
-  }
-
   pollTelemetry();
 
   // Collapse the lap-time footer again once lap-time messages stop (e.g.
@@ -804,7 +1052,7 @@ void loop() {
     standbyScreenInit();
   }
   if (currentScreen == SCREEN_STANDBY) {
-    standbyScreenUpdate(wheelLinkOk);
+    standbyScreenUpdate(hubLinkOk);
   }
 
   delay(2);

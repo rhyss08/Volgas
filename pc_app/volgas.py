@@ -67,8 +67,10 @@ from collections import deque
 from PIL import Image, ImageDraw, ImageTk
 
 import volgas_dash_font
+import volgas_devices as devs
 import volgas_theme as T
 import volgas_ui as ui
+import volgas_wheel_ota
 from volgas_theme import px
 from volgas_log import setup_logging
 from volgas_pedal_protocol import (
@@ -93,10 +95,17 @@ except Exception:
     logging.getLogger("volgas").exception("dash bridge unavailable - the dash and game telemetry are disabled")
     DASH_BRIDGE_AVAILABLE = False
 
+try:
+    import volgas_ffbeast_api
+    FFBEAST_AVAILABLE = True
+except Exception:
+    logging.getLogger("volgas").exception("FFBeast support unavailable - the wheelbase is disabled")
+    FFBEAST_AVAILABLE = False
+
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.3.0"
+VOLGAS_VERSION = "0.3.1"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -226,11 +235,10 @@ def show_splash(root):
 
 
 
-# FFBeast support was removed (user, 2026-10-31) ahead of Volgas's own
-# wheelbase firmware, so nothing talks to a wheelbase right now. The Wheelbase
-# tab and the Main tab's wheel controls are kept: they still remember their
-# values (volgas_settings.json) and send commands to wb_cmd_queue, ready for a
-# new backend. The settings below are still FFBeast's field names.
+# The wheelbase runs FFBeast (volgas_ffbeast_api). The board is the source of
+# truth: Volgas reads its settings on connect and shows them, and every change
+# is written straight to the board's RAM. Only Save & Reboot stores them on
+# the board; until then a restart of the board loses them.
 #
 # Wheelbase-tab slider range per FFBeast setting: (min, max), or ((value,
 # label), ...) for fields that only take a few values. Ranges follow the field
@@ -239,13 +247,12 @@ def show_splash(root):
 # where the header gives no range and these just cover this hardware with
 # room to spare. A value read from the device outside its range widens that
 # slider instead of being clipped (see _add_wb_slider_row). Fields deliberately
-# not on the tab (user, 2026-10-23), and left at whatever the board has saved:
-# EncoderCPR, ForceEnabled (the Main tab's Forces toggle still sets it),
-# CalibrationSpeed, BrakingLimit, EncoderDirection, ForceDirection, PolePairs,
-# DebugTorque, SpeedBufferSize, DirectXConstantDirection, CalibrationMagnitude,
-# PositionSmoothing. IntegratedSpringStrength is an on/off toggle
-# (_add_wb_spring_row); the soft-stop fields were fixed at strength 100,
-# range 0, dampening 5 and pushed on every connect.
+# not on the tab (user, 2026-10-23), and left at whatever the board has saved
+# (set them in FFBeast's own app): EncoderCPR, CalibrationSpeed, BrakingLimit,
+# EncoderDirection, ForceDirection, PolePairs, DebugTorque, SpeedBufferSize,
+# DirectXConstantDirection, CalibrationMagnitude, PositionSmoothing and the
+# soft-stop fields. ForceEnabled and IntegratedSpringStrength are on/off
+# switches (_add_wb_switch_row).
 WB_SLIDER_SPECS = {
     "MotionRange": (90, 1080),
     "StaticDampeningStrength": (0, 100),
@@ -276,6 +283,8 @@ WHEEL_SOURCE_WORKING_SIZE = 640  # keyed once at this resolution, then cheaply r
 WHEEL_IMAGE_NAME = "volgas_wheel.png"
 WHEEL_VERTICAL_OFFSET = 24  # px, nudges the photo down clear of the angle text above it
 WHEEL_RESIZE_THROTTLE_MS = 33
+WHEEL_SETTLE_MS = 150  # full-quality redraw this long after the wheel or the window stops changing
+WHEEL_MIN_ANGLE_STEP = 0.1  # degrees; smaller position changes don't redraw the photo
 CARD_PAD = 16  # inset between a card's edge and its contents
 WHEEL_CENTRE_BUTTON_Y = CARD_PAD + 20 + 22  # top of Set Centre: just under the angle readout centred at CARD_PAD + 20
 
@@ -330,6 +339,37 @@ def _rate_limited(widget, fn, interval_ms):
             state["dirty"] = True
 
     return trigger
+
+
+# A Label's text sits 3 px in from its edges (2 px border + 1 px padding);
+# canvas text replacing a Label is offset by this to stay where it was.
+LABEL_INSET = 3
+
+
+class _CanvasText:
+    """Lets canvas text be updated like the Label it replaced:
+    config(text=..., fg=...)."""
+
+    def __init__(self, canvas, item):
+        self.canvas, self.item = canvas, item
+
+    def config(self, text=None, fg=None):
+        options = {}
+        if text is not None:
+            options["text"] = text
+        if fg is not None:
+            options["fill"] = fg
+        self.canvas.itemconfig(self.item, **options)
+
+
+class _CanvasImage:
+    """config(image=...) for a canvas image item, like the Label it replaced."""
+
+    def __init__(self, canvas, item):
+        self.canvas, self.item = canvas, item
+
+    def config(self, image):
+        self.canvas.itemconfig(self.item, image=image)
 
 
 def _label_height(font):
@@ -789,19 +829,24 @@ class VolgasApp:
         self._curve_drag = None  # (pedal_key, point_index) while a curve point is being dragged, else None
 
         self.wb_cmd_queue = queue.Queue()
+        self.wb_status_queue = queue.Queue()
+        # field name -> the IntVars of every control showing that field
+        # (_add_wb_slider_row / _add_wb_switch_row), kept in step by _on_wb_settings.
+        self.wb_field_vars = {}
         self.wb_connected = False
+        self._wb_unsaved = False  # settings changed in the board's RAM since the last Save & Reboot
 
-        # Volgas is the source of truth for the wheelbase settings it shows:
-        # every change is remembered in volgas_settings.json ("wheelbase":
-        # {field: value}), meant to be pushed to the board on every connect
-        # once a wheelbase backend exists again (see WB_SLIDER_SPECS).
+        # The last values read from (or written to) the wheelbase, kept in
+        # volgas_settings.json ("wheelbase": {field: value}) so the page shows
+        # something sensible while it's unplugged. Never pushed to the board:
+        # on connect the board's own values replace them (see _wb_poll).
         self._wb_settings = _load_settings()
         self._wb_remembered = self._wb_settings.setdefault("wheelbase", {})
 
         # Layout: the title bar across the top (row 0), a navigation rail
         # down the left and the current page beside it (row 1). Pages are
         # device-centred, Home first - see _build_home_tab.
-        self._show_wheelbase = bool(self._wb_settings.get("show_wheelbase", False))
+        self._show_wheelbase = bool(self._wb_settings.get("show_wheelbase", FFBEAST_AVAILABLE))
         self.root.rowconfigure(1, weight=1)
         self.root.columnconfigure(1, weight=1)
         content = tk.Frame(self.root, bg=MAIN_BG)
@@ -811,15 +856,22 @@ class VolgasApp:
 
         page_names = ["Home", "Pedals", "Dash"]
         if self._show_wheelbase:
-            # Hidden by default (no wheelbase backend exists yet); enable with
-            # "show_wheelbase": true in the settings file. Saved wheelbase
-            # values are kept either way.
+            # Settings -> Support can hide it ("show_wheelbase" in the
+            # settings file).
             page_names.append("Wheelbase")
         page_names.append("Settings")
         self._tab_frames = {name: tk.Frame(content, bg=MAIN_BG) for name in page_names}
         for frame in self._tab_frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
 
+        self._wb_fw = None             # the wheelbase's firmware version, from its state reports
+        self._dev_manifest = None      # firmware list of the latest release; None = not checked
+        self._dev_checked = set()      # devices whose check result is shown
+        self._dev_error = None         # why the last device check failed
+        self._dev_busy = False         # a device check is running
+        self._dev_update_busy = False  # a wheel firmware update is running
+        self._dev_text = {}            # device -> status text of the running/last update
+        self._dev_queue = queue.Queue()
         self._update_queue = queue.Queue()
         self._update_busy = False
         self._dash_bridge = DashBridge() if DASH_BRIDGE_AVAILABLE else None
@@ -865,10 +917,20 @@ class VolgasApp:
             self._bridge_thread = threading.Thread(target=self._dash_bridge.run, args=(self._bridge_stop,),
                                                    name="dash-bridge", daemon=True)
             self._bridge_thread.start()
+        self._wb_stop = threading.Event()
+        self._wb_thread = None
+        if FFBEAST_AVAILABLE:
+            # Owns the wheelbase's HID handle for the app's whole lifetime;
+            # _on_close stops it.
+            self._wb_thread = threading.Thread(target=self._wb_worker_loop, name="wheelbase", daemon=True)
+            self._wb_thread.start()
+        self._wb_poll()
         self._status_poll()
         self._remove_old_exe()
         if self._wb_settings.get("check_updates_on_start", True):
             self._start_update_check()
+            self._check_updates()
+        self._updates_poll()
 
     # ---------- window chrome (dark tab strip as the title bar) ----------
 
@@ -904,10 +966,15 @@ class VolgasApp:
         pills = tk.Frame(bar, bg=T.SURFACE_RAIL)
         pills.pack(side="right", padx=(0, T.SPACE_3))
         self._game_pill = ui.StatusPill(pills, "idle", "No game", bg=T.SURFACE_RAIL)
-        self._dash_pill = ui.StatusPill(pills, "idle", "Dash", bg=T.SURFACE_RAIL)
-        self._pedal_pill = ui.StatusPill(pills, "idle", "Pedals", bg=T.SURFACE_RAIL)
-        for pill in (self._game_pill, self._dash_pill, self._pedal_pill):
-            pill.pack(side="right", padx=(T.SPACE_2, 0))
+        # Device pills (dash, hub, pedals, wheelbase) are only on screen while
+        # that device is NOT connected - a connected rig has nothing to
+        # report (see _apply_title_pills).
+        self._title_pills = {key: ui.StatusPill(pills, "idle", devs.DEVICE_NAMES[key], bg=T.SURFACE_RAIL)
+                             for key in ("dash", "hub", "pedals")}
+        if FFBEAST_AVAILABLE:
+            self._title_pills["wheelbase"] = ui.StatusPill(pills, "idle", "Wheelbase", bg=T.SURFACE_RAIL)
+        self._title_pills_shown = None
+        self._game_pill.pack(side="right", padx=(T.SPACE_2, 0))
 
         if not self._caption_hwnd:
             return
@@ -926,6 +993,18 @@ class VolgasApp:
         self.root.bind_class("VolgasTitleBar", "<Motion>", self._on_title_motion)
         self.root.bind_class("VolgasTitleBar", "<ButtonPress-1>", self._on_title_press)
         self.root.bind("<Configure>", self._sync_max_glyph, add="+")
+
+    def _apply_title_pills(self, shown):
+        """Show exactly the device pills named in `shown`, in a fixed order
+        (right to left: dash, hub, pedals, wheelbase, after the game pill)."""
+        shown = tuple(k for k in ("dash", "hub", "pedals", "wheelbase") if k in shown and k in self._title_pills)
+        if shown == self._title_pills_shown:
+            return
+        self._title_pills_shown = shown
+        for pill in self._title_pills.values():
+            pill.pack_forget()
+        for key in shown:
+            self._title_pills[key].pack(side="right", padx=(T.SPACE_2, 0))
 
     def _build_caption_buttons(self, bar):
         families = set(tkfont.families(self.root))
@@ -1030,6 +1109,7 @@ class VolgasApp:
             return "break"
 
     PAGE_TITLES = {"Home": "Home", "Pedals": "Pedals", "Dash": "Dash", "Wheelbase": "Wheelbase",
+
                    "Settings": "Settings"}
 
     def _build_nav_rail(self):
@@ -1065,7 +1145,8 @@ class VolgasApp:
         # catch it up once grid has mapped it (idle, after the layout pass).
         self.root.after_idle(self._refresh_wheel_cards)
         if name == "Wheelbase" and self.wb_connected:
-            # Refresh its fields from the device every time it's opened.
+            # Refresh its fields from the device every time it's opened (FFBeast's
+            # own app may have changed them).
             self.wb_cmd_queue.put(("read_settings",))
 
     def _show_update_badge(self, show):
@@ -1073,8 +1154,6 @@ class VolgasApp:
             self._update_badge.pack(side="left", padx=(T.SPACE_3, 0))
         else:
             self._update_badge.pack_forget()
-        if hasattr(self, "_nav"):
-            self._nav.set_badge("Settings", show)
 
     def _notify(self, text, kind="info"):
         """Non-blocking message in the window corner (replaces pop-ups for
@@ -1122,68 +1201,89 @@ class VolgasApp:
             win, width=max(1, e.width - 2 * T.SPACE_4), height=max(1, e.height - 2 * T.SPACE_4)), add="+")
         return card, inner
 
-    def _card_header(self, inner, title):
-        """Title on the left, status pill on the right. Returns the pill."""
-        header = tk.Frame(inner, bg=MAIN_PANEL)
-        header.pack(side="top", fill="x")
-        tk.Label(header, text=title, font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(side="left")
-        pill = ui.StatusPill(header, "idle", "Checking...", bg=MAIN_PANEL)
-        pill.pack(side="right")
-        return pill
+    def _home_card(self, parent, title):
+        """A Home card drawn on one canvas (no frames of packed widgets inside
+        it: those re-laid-out on every resize event and made resizing the
+        window lag). Title on the left, status pill on the right, and a
+        button frame bottom right. Returns (card, pill, footer, top of the
+        body, layout list); each layout entry is called as fn(width, height)
+        on every resize."""
+        card = self._make_flat_card(parent, px(420), px(262))
+        pill = ui.StatusPill(card, "idle", "Checking...", bg=MAIN_PANEL)
+        header_h = max(_label_height(T.FONT_TITLE), int(pill.cget("height")))
+        card.create_text(T.SPACE_4 + LABEL_INSET, T.SPACE_4 + header_h / 2, text=title, font=T.FONT_TITLE,
+                         fill=T.TEXT_PRIMARY, anchor="w")
+        pill_id = card.create_window(0, T.SPACE_4 + header_h / 2, window=pill, anchor="e")
+        pill._card, pill._item = card, pill_id   # for _show_card_pill
+        footer = tk.Frame(card, bg=MAIN_PANEL)
+        footer_id = card.create_window(0, 0, window=footer, anchor="e")
+        layout = []
+
+        def on_resize(event):
+            w, h = event.width, event.height
+            if w <= 1 or h <= 1:
+                return
+            card.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + header_h / 2)
+            foot_h = max(_label_height(T.FONT_CAPTION), footer.winfo_reqheight())
+            card.coords(footer_id, w - T.SPACE_4, h - T.SPACE_4 - foot_h / 2)
+            for fn in layout:
+                fn(w, h)
+
+        card.bind("<Configure>", on_resize, add="+")
+        return card, pill, footer, T.SPACE_4 + header_h + T.SPACE_3, layout
 
     def _build_home_pedals_card(self, parent):
-        card, inner = self._make_frame_card(parent, 420, 262)
-        self._home_pedal_pill = self._card_header(inner, "Pedals")
-
-        body = tk.Frame(inner, bg=MAIN_PANEL)
-        body.pack(side="top", fill="both", expand=True, pady=(T.SPACE_3, T.SPACE_2))
-        body.grid_columnconfigure(0, weight=1, uniform="pedal")
-        body.grid_columnconfigure(1, weight=1, uniform="pedal")
+        card, self._home_pedal_pill, footer, body_top, layout = self._home_card(parent, "Pedals")
+        caption_h, value_h = _label_height(T.FONT_CAPTION), _label_height(T.FONT_DISPLAY)
+        bar_h = px(10)
+        bar_top = body_top + caption_h + value_h + T.SPACE_1
 
         def gauge(column, name, color):
-            box = tk.Frame(body, bg=MAIN_PANEL)
-            box.grid(row=0, column=column, sticky="nsew", padx=(0, T.SPACE_3) if column == 0 else (T.SPACE_3, 0))
-            tk.Label(box, text=name, font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL).pack(anchor="w")
-            value = tk.Label(box, text="--", font=T.FONT_DISPLAY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL)
-            value.pack(anchor="w")
-            bar_h = px(10)
-            bar = tk.Canvas(box, height=bar_h, bg=MAIN_PANEL, highlightthickness=0)
-            bar.pack(fill="x", pady=(T.SPACE_1, 0))
-            track = ui.draw_round_rect(bar, 0, 0, bar_h, bar_h, bar_h / 2, fill=T.SURFACE_RAISED, outline="")
-            fill = ui.draw_round_rect(bar, 0, 0, 0, bar_h, bar_h / 2, fill=color, outline="")
-            state = {"raw": None, "shown": None}
+            caption_id = card.create_text(0, body_top + caption_h / 2, text=name, font=T.FONT_CAPTION,
+                                          fill=T.TEXT_SECONDARY, anchor="w")
+            value_id = card.create_text(0, body_top + caption_h + value_h / 2, text="--", font=T.FONT_DISPLAY,
+                                        fill=T.TEXT_PRIMARY, anchor="w")
+            track = ui.draw_round_rect(card, 0, 0, bar_h, bar_h, bar_h / 2, fill=T.SURFACE_RAISED, outline="")
+            fill = ui.draw_round_rect(card, 0, 0, 0, bar_h, bar_h / 2, fill=color, outline="")
+            state = {"raw": None, "shown": None, "x0": 0, "x1": 0}
 
-            def redraw(_e=None):
-                w = bar.winfo_width()
-                if w <= 1:
+            def redraw():
+                x0, x1 = state["x0"], state["x1"]
+                if x1 - x0 <= bar_h:
                     return
-                bar.coords(track, *ui.round_rect_points(0, 0, w, bar_h, bar_h / 2))
+                card.coords(track, *ui.round_rect_points(x0, bar_top, x1, bar_top + bar_h, bar_h / 2))
                 frac = 0.0 if state["raw"] is None else max(0.0, min(1.0, state["raw"] / AXIS_MAX))
                 if frac <= 0.01:
-                    bar.itemconfig(fill, state="hidden")
+                    card.itemconfig(fill, state="hidden")
                 else:
-                    bar.itemconfig(fill, state="normal")
-                    bar.coords(fill, *ui.round_rect_points(0, 0, max(bar_h, w * frac), bar_h, bar_h / 2))
+                    card.itemconfig(fill, state="normal")
+                    card.coords(fill, *ui.round_rect_points(x0, bar_top, x0 + max(bar_h, (x1 - x0) * frac),
+                                                            bar_top + bar_h, bar_h / 2))
+
+            def place(w, _h):
+                # Two equal columns across the card's padded width, with
+                # 2 x SPACE_3 between them.
+                half = (w - 2 * T.SPACE_4) / 2
+                x0 = T.SPACE_4 + (0 if column == 0 else half + T.SPACE_3)
+                state["x0"], state["x1"] = x0, x0 + half - T.SPACE_3
+                card.coords(caption_id, x0 + LABEL_INSET, body_top + caption_h / 2)
+                card.coords(value_id, x0 + LABEL_INSET, body_top + caption_h + value_h / 2)
+                redraw()
 
             def update(raw):
                 state["raw"] = raw
                 text = "--" if raw is None else f"{round(max(0.0, min(1.0, raw / AXIS_MAX)) * 100)}%"
                 if text != state["shown"]:
                     state["shown"] = text
-                    value.config(text=text, fg=T.TEXT_PRIMARY if raw is not None else T.TEXT_HINT)
-                if bar.winfo_viewable():
+                    card.itemconfig(value_id, text=text, fill=T.TEXT_PRIMARY if raw is not None else T.TEXT_HINT)
+                if card.winfo_viewable():
                     redraw()
 
-            bar.bind("<Configure>", redraw)
+            layout.append(place)
             return update
 
         self.main_throttle_update = gauge(0, "Throttle", MAIN_GREEN)
         self.main_brake_update = gauge(1, "Brake", MAIN_RED)
-
-        footer = tk.Frame(inner, bg=MAIN_PANEL)
-        footer.pack(side="bottom", fill="x")
-        self._home_pedal_note = tk.Label(footer, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
-        self._home_pedal_note.pack(side="left")
         ui.FlatButton(footer, "Open pedals", command=lambda: self._select_tab("Pedals"),
                       font=T.FONT_CAPTION).pack(side="right")
         self.main_throttle_update(None)
@@ -1191,30 +1291,28 @@ class VolgasApp:
         return card
 
     def _build_home_dash_card(self, parent):
-        card, inner = self._make_frame_card(parent, 420, 262)
-        self._home_dash_pill = self._card_header(inner, "Dash")
-
-        body = tk.Frame(inner, bg=MAIN_PANEL)
-        body.pack(side="top", fill="both", expand=True, pady=(T.SPACE_3, T.SPACE_2))
-        self._home_dash_image = tk.Label(body, bg=MAIN_BG, bd=0, highlightthickness=1,
-                                         highlightbackground=MAIN_BORDER)
-        self._home_dash_image.pack(side="left", anchor="n")
+        card, self._home_dash_pill, footer, body_top, _layout = self._home_card(parent, "Dash")
+        size = px(DASH_SIZE)
+        card.create_rectangle(T.SPACE_4, body_top, T.SPACE_4 + size + 1, body_top + size + 1, outline=MAIN_BORDER,
+                              fill=MAIN_BG)
+        image_id = card.create_image(T.SPACE_4 + 1, body_top + 1, anchor="nw")
+        self._home_dash_image = _CanvasImage(card, image_id)
         self._home_dash_shown = None
-        info = tk.Frame(body, bg=MAIN_PANEL)
-        info.pack(side="left", fill="both", expand=True, padx=(T.SPACE_4, 0))
-        tk.Label(info, text="Game", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL).pack(anchor="w")
-        self._home_game_label = tk.Label(info, text="--", font=T.FONT_LABEL, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL)
-        self._home_game_label.pack(anchor="w")
-        tk.Label(info, text="Showing", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
-                 bg=MAIN_PANEL).pack(anchor="w", pady=(T.SPACE_2, 0))
-        self._home_dash_detail = tk.Label(info, text="--", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL,
-                                          justify="left", wraplength=px(210))
-        self._home_dash_detail.pack(anchor="w")
 
-        footer = tk.Frame(inner, bg=MAIN_PANEL)
-        footer.pack(side="bottom", fill="x")
-        self._home_dash_note = tk.Label(footer, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
-        self._home_dash_note.pack(side="left")
+        x = T.SPACE_4 + size + 2 + T.SPACE_4 + LABEL_INSET
+        caption_h = _label_height(T.FONT_CAPTION)
+        y = body_top
+        card.create_text(x, y + caption_h / 2, text="Game", font=T.FONT_CAPTION, fill=T.TEXT_SECONDARY, anchor="w")
+        y += caption_h
+        label_h = _label_height(T.FONT_LABEL)
+        self._home_game_label = _CanvasText(card, card.create_text(
+            x, y + label_h / 2, text="--", font=T.FONT_LABEL, fill=T.TEXT_PRIMARY, anchor="w"))
+        y += label_h + T.SPACE_2
+        card.create_text(x, y + caption_h / 2, text="Showing", font=T.FONT_CAPTION, fill=T.TEXT_SECONDARY,
+                         anchor="w")
+        y += caption_h
+        self._home_dash_detail = _CanvasText(card, card.create_text(
+            x, y + LABEL_INSET, text="--", font=T.FONT_BODY, fill=T.TEXT_PRIMARY, anchor="nw", width=px(210)))
         ui.FlatButton(footer, "Open dash", command=lambda: self._select_tab("Dash"),
                       font=T.FONT_CAPTION).pack(side="right")
         return card
@@ -1388,19 +1486,28 @@ class VolgasApp:
             self._load_wheel_image()
 
         canvas = self._make_flat_card(parent, width, height, outline="" if wheelbase_controls else MAIN_BORDER)
-        state = {"size": None, "base": None, "photo": None}
-        # Without wheelbase controls (Home) the card has a title row and a
-        # footer instead of the angle readout and Set Centre.
-        header_h = 0 if wheelbase_controls else px(44)
+        state = {"size": None, "base": None, "base_fast": False, "photo": None, "drawn": None, "settle": None}
+        # Without wheelbase controls (Home) the card has a title row, then the
+        # steering range and power rows and a row of range presets and Set
+        # Centre (_add_home_wheel_rows), and the angle readout sits under the photo.
+        title_h = px(44)
+        header_h = 0 if wheelbase_controls else title_h + 3 * WB_ROW_H
         footer_h = 0 if wheelbase_controls else px(52)
 
-        def resize_photo(size):
+        def resize_photo(size, fast):
             size = max(px(40), int(size))
-            if size != state["size"]:
-                state["size"] = size
-                state["base"] = self._wheel_flat_full.resize((size, size), Image.LANCZOS)
+            if size != state["size"] or (state["base_fast"] and not fast):
+                state["size"], state["base_fast"] = size, fast
+                state["base"] = self._wheel_flat_full.resize((size, size), Image.BILINEAR if fast else Image.LANCZOS)
 
-        def draw(angle_deg):
+        def draw(angle_deg, fast=False):
+            """fast: a cheaper rotation while the wheel moves or the window
+            is being resized (a full-quality rotation of a large photo took
+            20-35 ms); a full-quality frame follows once things settle."""
+            key = (round(angle_deg, 2), state["size"], fast or state["base_fast"])
+            if key == state["drawn"]:
+                return
+            state["drawn"] = key
             # Always rotate from the pristine base image, never from the
             # previous rotated frame - repeatedly re-rotating an already-rotated
             # image would compound resampling blur across updates.
@@ -1408,12 +1515,20 @@ class VolgasApp:
             # here so a positive angle_deg (matching the FFBeast Position/turning
             # right) turns the picture clockwise. Flip the sign if that turns
             # out backwards against the real wheel.
-            rotated = state["base"].rotate(-angle_deg, resample=Image.BICUBIC, expand=False,
-                                           fillcolor=self._wheel_fill_rgb)
-            state["photo"] = ImageTk.PhotoImage(rotated)  # keep a reference - Tk drops GC'd images
-            canvas.itemconfig(image_id, image=state["photo"])
-            if wheelbase_controls:
-                canvas.itemconfig(text_id, text=f"{angle_deg:+.0f}°")
+            rotated = state["base"].rotate(-angle_deg, resample=Image.BILINEAR if fast else Image.BICUBIC,
+                                           expand=False, fillcolor=self._wheel_fill_rgb)
+            photo = state["photo"]
+            if photo is not None and (photo.width(), photo.height()) == rotated.size:
+                photo.paste(rotated)  # updates the shown image in place
+            else:
+                state["photo"] = ImageTk.PhotoImage(rotated)  # keep a reference - Tk drops GC'd images
+                canvas.itemconfig(image_id, image=state["photo"])
+            canvas.itemconfig(text_id, text=f"{angle_deg:+.0f}°")
+
+        def settle():
+            state["settle"] = None
+            resize_photo(state["size"], fast=False)
+            draw(self._last_wheel_angle)
 
         def apply_resize():
             w, h = canvas.winfo_width(), canvas.winfo_height()
@@ -1422,12 +1537,16 @@ class VolgasApp:
             # within the corner radius of the card's sides: the photo is an
             # opaque square, and its card-coloured corners mustn't cover the
             # card's rounded corners.
-            resize_photo(min(w - px(40), h - 2 * CARD_PAD - px(4) - header_h - footer_h))
-            draw(self._last_wheel_angle)
+            resize_photo(min(w - px(40), h - 2 * CARD_PAD - px(4) - header_h - footer_h), fast=True)
+            draw(self._last_wheel_angle, fast=True)
+            if state["settle"] is not None:
+                canvas.after_cancel(state["settle"])
+            state["settle"] = canvas.after(WHEEL_SETTLE_MS, settle)
 
         # Resampling the photo costs several ms and a drag-resize sends dozens
         # of resize events a second, so it's rate-limited to
-        # WHEEL_RESIZE_THROTTLE_MS, at whatever size the canvas has by then.
+        # WHEEL_RESIZE_THROTTLE_MS, at whatever size the canvas has by then,
+        # with cheap resampling until the resize stops (settle).
         resize_soon = _rate_limited(canvas, apply_resize, WHEEL_RESIZE_THROTTLE_MS)
 
         def on_resize(event):
@@ -1443,23 +1562,23 @@ class VolgasApp:
             else:
                 canvas.coords(image_id, w / 2, (header_h + h - footer_h) / 2)
                 canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + px(12))
-                canvas.coords(divider_id, T.SPACE_4, h - footer_h, w - T.SPACE_4, h - footer_h)
-                canvas.coords(foot_left_id, T.SPACE_4, h - footer_h / 2)
+                canvas.coords(text_id, w / 2, h - footer_h / 2)
             resize_soon()
 
-        resize_photo(MAIN_WHEEL_CANVAS_SIZE)
+        resize_photo(MAIN_WHEEL_CANVAS_SIZE, fast=False)
         state["photo"] = ImageTk.PhotoImage(state["base"])
         image_id = canvas.create_image(0, 0, image=state["photo"])
         if not wheelbase_controls:
             canvas.create_text(T.SPACE_4, T.SPACE_4 + px(12), text="Steering wheel", font=T.FONT_TITLE,
                                fill=T.TEXT_PRIMARY, anchor="w")
-            # The dash relays the wheel's buttons to Windows but doesn't
-            # report the radio link to the PC yet, so say so honestly.
-            pill = ui.StatusPill(canvas, "idle", "Link not reported", bg=MAIN_PANEL)
+            # The wheel's radio link to the hub; only on screen while it's down.
+            pill = ui.StatusPill(canvas, "idle", "Not linked", bg=MAIN_PANEL)
             pill_id = canvas.create_window(0, 0, window=pill, anchor="e")
-            divider_id = canvas.create_line(0, 0, 0, 0, fill=MAIN_BORDER)
-            foot_left_id = canvas.create_text(0, 0, anchor="w", font=T.FONT_CAPTION, fill=T.TEXT_SECONDARY,
-                                              text="12 buttons  \u00b7  wireless, through the dash")
+            pill._card, pill._item = canvas, pill_id
+            self._home_wheel_pill = pill
+            # The steering angle, under the photo.
+            text_id = canvas.create_text(0, 0, text="+0\u00b0", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
+            self._add_home_wheel_rows(canvas, title_h)
             canvas.bind("<Configure>", on_resize, add="+")
             self._wheel_cards.append((canvas, draw))
             return canvas
@@ -1475,6 +1594,28 @@ class VolgasApp:
         canvas.bind("<Configure>", on_resize, add="+")
         self._wheel_cards.append((canvas, draw))
         return canvas
+
+    def _add_home_wheel_rows(self, card, top):
+        """Home's wheel controls under the card title: steering range and
+        power (the wheelbase's MotionRange and PowerLimit, the same rows as
+        on the Wheelbase page and kept in step with them), then 360/540/900
+        presets under the range bar and Set Centre on the right."""
+        rows = (("MotionRange", "STEERING RANGE"), ("PowerLimit", "POWER"))
+        name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(label) for _n, label in rows) + px(24)
+        for i, (name, label) in enumerate(rows):
+            self._add_wb_slider_row(card, top + i * WB_ROW_H, name, name_w, label=label)
+        presets = tk.Frame(card, bg=MAIN_PANEL)
+        for deg in (360, 540, 900):
+            ui.FlatButton(presets, f"{deg}°", font=T.FONT_CAPTION,
+                          command=lambda d=deg: self._set_motion_range_preset(d)).pack(side="left", padx=(0, T.SPACE_2))
+        row_mid = top + 2 * WB_ROW_H + WB_ROW_H / 2
+        card.create_window(CARD_PAD + name_w, row_mid, window=presets, anchor="w")
+        # Set Centre on the same row, lined up with the right end of the value column.
+        centre = ui.FlatButton(card, "Set Centre", font=T.FONT_CAPTION,
+                               command=lambda: self._wb_send_command(("reset_center",)))
+        centre_id = card.create_window(0, row_mid, window=centre, anchor="e")
+        card.bind("<Configure>", lambda e: card.coords(centre_id, e.width - CARD_PAD - px(4), row_mid), add="+")
+        card.bind("<Enter>", lambda _e: card.focus_set(), add="+")  # mouse wheel / arrow keys on the rows
 
     def _redraw_forces_toggle(self):
         if hasattr(self, "main_forces_toggle"):
@@ -1510,14 +1651,18 @@ class VolgasApp:
         self._wb_send_command(("send_setting", "MotionRange", deg))
 
     def _remember_wb(self, name, value):
-        """Remember a wheelbase setting so it's re-applied on every connect
-        (see __init__'s _wb_remembered comment) - also while disconnected."""
+        """Remember a wheelbase setting for display while it's unplugged (see
+        __init__'s _wb_remembered comment)."""
         self._wb_remembered[name] = value
         _save_settings(self._wb_settings)
 
     def _set_motion_range_preset(self, deg):
-        self.main_motion_range_var.set(deg)
-        self._on_motion_range_release(None)
+        if not self._wb_require_connected():
+            return
+        self._remember_wb("MotionRange", deg)
+        self._on_wb_settings({"MotionRange": deg})
+        self._wb_write("MotionRange", deg)
+        self._wb_verify("MotionRange", deg)
 
     def _load_wheel_image(self):
         """Load + key out the wheel photo ONCE at a fairly high working
@@ -1566,18 +1711,46 @@ class VolgasApp:
         self._wheel_flat_full = flat
 
     def _update_main_wheel(self, position):
-        motion_range = self.main_motion_range_var.get()
-        self._last_wheel_angle = (position / 10000.0) * (motion_range / 2.0)
+        """New wheelbase position (the board streams ~500 a second, the same
+        value while the wheel is still). Rotating a large photo is expensive,
+        so the wheel is only redrawn when the angle changes, with the cheap
+        rotation while it moves, at most often enough to use about half the
+        interface's time, and once at full quality after it stops."""
+        angle = (position / 10000.0) * (self.main_motion_range_var.get() / 2.0)
+        if abs(angle - self._last_wheel_angle) < WHEEL_MIN_ANGLE_STEP:
+            return
+        self._last_wheel_angle = angle
+        if getattr(self, "_wheel_draw_timer", None) is None:
+            delay = max(0.0, getattr(self, "_wheel_next_draw", 0.0) - time.monotonic())
+            self._wheel_draw_timer = self.root.after(int(delay * 1000), self._draw_moving_wheel)
+
+    def _draw_moving_wheel(self):
+        self._wheel_draw_timer = None
+        start = time.monotonic()
+        for canvas, draw in getattr(self, "_wheel_cards", ()):
+            if canvas.winfo_viewable():
+                draw(self._last_wheel_angle, fast=True)
+        cost = time.monotonic() - start
+        self._wheel_next_draw = start + max(1 / 60, 2 * cost)
+        if getattr(self, "_wheel_settle_timer", None) is not None:
+            self.root.after_cancel(self._wheel_settle_timer)
+        self._wheel_settle_timer = self.root.after(WHEEL_SETTLE_MS, self._settle_wheel)
+
+    def _settle_wheel(self):
+        self._wheel_settle_timer = None
         self._refresh_wheel_cards()
 
     def _refresh_wheel_cards(self):
-        """Draw the wheel at the latest angle on every card that's on screen.
-        A card on a hidden tab is skipped - rotating the photo costs several
-        ms per card at the ~60 Hz position rate - and catches up when its tab
-        is shown (_select_tab)."""
+        """Draw the wheel at the latest angle, at full quality, on every card
+        that's on screen. A card on a hidden tab is skipped and catches up
+        when its tab is shown (_select_tab)."""
         for canvas, draw in getattr(self, "_wheel_cards", ()):
             if canvas.winfo_viewable():
                 draw(self._last_wheel_angle)
+
+    @staticmethod
+    def _show_card_pill(pill, visible):
+        pill._card.itemconfig(pill._item, state="normal" if visible else "hidden")
 
     def _build_pedals_tab(self, parent):
         root = tk.Frame(parent, bg=MAIN_BG)
@@ -2037,32 +2210,28 @@ class VolgasApp:
         # all stacked in a single column.
         top = tk.Frame(parent, bg=MAIN_BG)
         top.pack(fill="x", padx=px(20), pady=(px(12), px(8)))
-        self.wb_status_label = tk.Label(top, text="no wheelbase support yet", font=("Segoe UI", 9),
-                                        fg="gray", bg=MAIN_BG)
+        self.wb_status_label = tk.Label(top, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_BG)
         self.wb_status_label.pack(side="left")
-        # Only Save & Reboot: every change applies as it happens and Volgas
-        # re-applies its remembered values on connect, so there's no Apply
-        # button; Reboot and Reset Center were dropped too (Set Centre is on
-        # the Main tab).
-        tk.Button(top, text="Save & Reboot", font=("Segoe UI", 9), fg=MAIN_TEXT, bg=MAIN_PANEL,
-                  activebackground=MAIN_BORDER, activeforeground=MAIN_TEXT, relief="flat",
-                  padx=px(12), pady=px(4), bd=0, cursor="hand2",
-                  command=lambda: self._wb_send_command(("save_and_reboot",))).pack(side="right")
+        # Every change applies to the board's RAM as it happens, so there's
+        # no Apply button. Set Centre is on the wheel card below.
+        self._wb_save_btn = ui.FlatButton(top, "Save & Reboot", variant="primary", font=T.FONT_CAPTION,
+                                          command=lambda: self._wb_send_command(("save_and_reboot",)))
+        self._wb_save_btn.pack(side="right")
 
-        # name -> IntVar holding the field's real value for every setting on
-        # this tab - written by the read_effect_settings()/
-        # read_hardware_settings() sync (_on_wb_settings) and by the rows.
-        self.wb_field_vars = {}
         effect_keys, hardware_keys = list(WB_EFFECT_KEYS), list(WB_HARDWARE_KEYS)
+        switches = {"ForceEnabled": ("FORCES", 1), "IntegratedSpringStrength": ("INTEGRATED SPRING",
+                                                                                 INTEGRATED_SPRING_ON_PCT)}
         # One name column wide enough for the longest name, so every bar
         # starts at the same x.
-        names = [_wb_display_name(k).upper() for k in effect_keys + hardware_keys] + ["INTEGRATED SPRING"]
+        names = [_wb_display_name(k).upper() for k in effect_keys + hardware_keys] + [s[0] for s in switches.values()]
         name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + px(24)
 
-        # One card, one list: the effect settings, the Integrated Spring
-        # switch, then the hardware settings, with no section headings
-        # (user, 2026-10-23), and the Power Limit caution as the last line.
-        rows = [("slider", k) for k in effect_keys] + [("spring", None)] + [("slider", k) for k in hardware_keys]
+        # One card, one list: the Forces switch, the effect settings, the
+        # Integrated Spring switch, then the hardware settings, with no
+        # section headings (user, 2026-10-23), and the Power Limit caution as
+        # the last line.
+        rows = ([("switch", "ForceEnabled")] + [("slider", k) for k in effect_keys]
+                + [("switch", "IntegratedSpringStrength")] + [("slider", k) for k in hardware_keys])
         # A copy of the Main tab's wheel card at the top, centred, filling all
         # the height the settings card below doesn't need. The settings card
         # is packed first (from the bottom) so if the window is short it's the
@@ -2084,8 +2253,9 @@ class VolgasApp:
 
         wheel_card.bind("<Configure>", keep_proportions, add="+")
         for i, (kind, key) in enumerate(rows):
-            if kind == "spring":
-                self._add_wb_spring_row(card, WB_ROWS_TOP + i * WB_ROW_H, name_w)
+            if kind == "switch":
+                label, on_value = switches[key]
+                self._add_wb_switch_row(card, WB_ROWS_TOP + i * WB_ROW_H, name_w, key, label, on_value)
             else:
                 self._add_wb_slider_row(card, WB_ROWS_TOP + i * WB_ROW_H, key, name_w)
         card.create_text(CARD_PAD + px(4), WB_ROWS_TOP + len(rows) * WB_ROW_H + WB_ROW_H / 2,
@@ -2096,6 +2266,7 @@ class VolgasApp:
         # not the one under the pointer - so the card takes focus on hover and
         # its rows' wheel / arrow-key nudges work.
         card.bind("<Enter>", lambda _e: card.focus_set(), add="+")
+        self._update_wb_status()
 
     def _build_dashboard_tab(self, parent):
         """A live picture of the ESP32 dash's screen (see _render_dash), on a
@@ -2143,6 +2314,28 @@ class VolgasApp:
         """Opened by clicking the logo (no tab button). Holds the updater, on a
         flat card like the other pages: version, a check-on-startup switch,
         status, Check / Update buttons and the newer release's notes."""
+        # Two sections, switched at the top: the app's own update and support
+        # info, and the firmware updates for each device.
+        switch = tk.Frame(parent, bg=MAIN_BG)
+        switch.pack(anchor="w", padx=px(20), pady=(px(12), 0))
+        general = tk.Frame(parent, bg=MAIN_BG)
+        devices = tk.Frame(parent, bg=MAIN_BG)
+        sections = {"Volgas": general, "Device updates": devices}
+        section_buttons = {}
+
+        def show_section(name):
+            for key, frame in sections.items():
+                frame.pack_forget()
+                section_buttons[key].set_selected(key == name)
+            sections[name].pack(fill="both", expand=True)
+
+        for name in sections:
+            section_buttons[name] = ui.FlatButton(switch, name, command=lambda n=name: show_section(n),
+                                                  font=T.FONT_CAPTION)
+            section_buttons[name].pack(side="left", padx=(0, T.SPACE_2))
+        self._show_settings_section = show_section
+        self._build_updates_tab(devices)
+        parent = general   # the rest builds the Volgas section
         names = ["VERSION", "CHECK ON STARTUP", "STATUS", "WHAT'S NEW"]
         name_w = max(tkfont.Font(font=WB_NAME_FONT).measure(n) for n in names) + px(24)
         rows = 8  # version, switch, status, buttons, then four for release notes
@@ -2193,10 +2386,11 @@ class VolgasApp:
         self._settings_card = card
         self._fit_settings_card()
         self._build_support_card(parent)
+        show_section("Volgas")
 
     def _build_support_card(self, parent):
         """Where Volgas keeps its files, a shortcut to the log for bug
-        reports, and the experimental Wheelbase page switch."""
+        reports, and the Wheelbase page switch."""
         card, inner = self._make_frame_card(parent, 520, 190)  # 100% sizes
         card.pack(padx=px(20), pady=(0, px(20)))
         tk.Label(inner, text="Support", font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(anchor="w")
@@ -2374,24 +2568,23 @@ class VolgasApp:
         card.bind("<Configure>", lambda e: card.coords(value_id, e.width - CARD_PAD - px(4), mid), add="+")
         return value_id, mid
 
-    def _add_wb_slider_row(self, card, row_top, name, name_w):
+    def _add_wb_slider_row(self, card, row_top, name, name_w, label=None):
         """One Wheelbase setting (range from WB_SLIDER_SPECS) as a full-width
         row on a flat card: name, glow-pill bar (same halo + cap look as the
         Main tab's sliders), value. Click or drag the bar to set it; fields
         with only a few valid values step between them. Sends every change
-        straight away, while dragging too, and remembers the value (re-applied
-        on every connect) once the drag ends - not on every intermediate
-        position, which would rewrite the settings file at drag rate. Mouse
-        wheel / arrow keys over the row nudge by exactly one step, so precise
-        values are reachable. Sending silently does nothing while
-        disconnected; the remembered value is applied on the next connect."""
+        straight away, while dragging too, and remembers the value once the
+        drag ends - not on every intermediate position, which would rewrite
+        the settings file at drag rate. Mouse wheel / arrow keys over the row
+        nudge by exactly one step, so precise values are reachable. While the
+        wheelbase is disconnected the row can't be changed."""
         spec = WB_SLIDER_SPECS[name]
         choices = spec if isinstance(spec[0], tuple) else None
         bounds = None if choices else list(spec)
         unit = "%" if spec == (0, 100) else "°" if name == "MotionRange" else ""
         value_var = tk.IntVar(value=self._wb_remembered.get(name, choices[0][0] if choices else spec[0]))
-        self.wb_field_vars[name] = value_var
-        value_id, mid = self._add_wb_row_label(card, row_top, _wb_display_name(name).upper())
+        self.wb_field_vars.setdefault(name, []).append(value_var)
+        value_id, mid = self._add_wb_row_label(card, row_top, label or _wb_display_name(name).upper())
 
         color = MAIN_CYAN if name == "MotionRange" else MAIN_BLUE  # matching the Main tab's Steering Range / FFB bars
         halo_color = _mix_color(MAIN_PANEL, color, 0.35)
@@ -2436,8 +2629,7 @@ class VolgasApp:
         def set_value(value):
             if value != value_var.get():
                 value_var.set(value)
-                if self.wb_connected:
-                    self.wb_cmd_queue.put(("send_setting", name, value))
+                self._wb_write(name, value)
 
         def set_from_x(x):
             x0, x1 = bar_x()
@@ -2451,6 +2643,7 @@ class VolgasApp:
             value = value_var.get()
             self._remember_wb(name, value)
             self._on_wb_settings({name: value})  # keep the Main tab's matching controls in step
+            self._wb_verify(name, value)
 
         def nudge(steps):
             if choices:
@@ -2464,7 +2657,7 @@ class VolgasApp:
 
         def press(event):
             x0, x1 = bar_x()
-            if in_row(event) and x0 - px(6) <= event.x <= x1 + px(6):
+            if in_row(event) and x0 - px(6) <= event.x <= x1 + px(6) and self._wb_require_connected():
                 state["dragging"] = True
                 set_from_x(event.x)
 
@@ -2479,8 +2672,12 @@ class VolgasApp:
                 commit()
 
         def key(steps):
-            if state["hover"]:
+            if state["hover"] and self.wb_connected:
                 nudge(steps)
+
+        def wheel(event):
+            if in_row(event) and self.wb_connected:
+                nudge(1 if event.delta > 0 else -1)
 
         card.bind("<Configure>", redraw, add="+")
         card.bind("<Button-1>", press, add="+")
@@ -2488,31 +2685,38 @@ class VolgasApp:
         card.bind("<Motion>", motion, add="+")
         card.bind("<Leave>", lambda _e: state.update(hover=False), add="+")
         card.bind("<ButtonRelease-1>", release, add="+")
-        card.bind("<MouseWheel>", lambda e: nudge(1 if e.delta > 0 else -1) if in_row(e) else None, add="+")
+        card.bind("<MouseWheel>", wheel, add="+")
         card.bind("<Left>", lambda _e: key(-1), add="+")
         card.bind("<Right>", lambda _e: key(1), add="+")
         value_var.trace_add("write", redraw)
         redraw()
 
-    def _add_wb_spring_row(self, card, row_top, name_w):
-        """Integrated Spring as an on/off switch row instead of a slider: on
-        sets it to INTEGRATED_SPRING_ON_PCT, off to 0. Shows On if the device
-        reports any non-zero strength (e.g. one set in FFBeast's own app)."""
-        var = tk.IntVar(value=self._wb_remembered.get("IntegratedSpringStrength", 0))
-        self.wb_field_vars["IntegratedSpringStrength"] = var
-        value_id, mid = self._add_wb_row_label(card, row_top, "INTEGRATED SPRING")
+    def _add_wb_switch_row(self, card, row_top, name_w, name, label, on_value):
+        """An on/off switch row instead of a slider: on sets the field to
+        on_value, off to 0. Shows On for any non-zero value the board reports
+        (e.g. a spring strength set in FFBeast's own app)."""
+        var = tk.IntVar(value=self._wb_remembered.get(name, 0))
+        self.wb_field_vars.setdefault(name, []).append(var)
+        value_id, mid = self._add_wb_row_label(card, row_top, label)
         x, y = CARD_PAD + name_w, mid - px(10)  # top-left of the 40x20 switch, where the bars start
+        tag = f"wb_switch_{name}"
 
         def redraw(*_args):
-            _draw_toggle(card, var.get() > 0, x, y, tag="wb_spring_toggle")
-            card.itemconfig(value_id, text=f"{var.get()}%" if var.get() > 0 else "Off")
+            _draw_toggle(card, var.get() > 0, x, y, tag=tag)
+            if var.get() <= 0:
+                text = "Off"
+            else:
+                text = f"{var.get()}%" if on_value > 1 else "On"
+            card.itemconfig(value_id, text=text)
 
         def press(event):
-            if x - px(4) <= event.x <= x + px(44) and y - px(4) <= event.y <= y + px(24):
-                var.set(0 if var.get() > 0 else INTEGRATED_SPRING_ON_PCT)
-                self._remember_wb("IntegratedSpringStrength", var.get())
-                if self.wb_connected:
-                    self.wb_cmd_queue.put(("send_setting", "IntegratedSpringStrength", var.get()))
+            if (x - px(4) <= event.x <= x + px(44) and y - px(4) <= event.y <= y + px(24)
+                    and self._wb_require_connected()):
+                var.set(0 if var.get() > 0 else on_value)
+                self._remember_wb(name, var.get())
+                self._on_wb_settings({name: var.get()})
+                self._wb_write(name, var.get())
+                self._wb_verify(name, var.get())
 
         var.trace_add("write", redraw)
         card.bind("<Button-1>", press, add="+")
@@ -2642,21 +2846,175 @@ class VolgasApp:
 
     # ---------- wheelbase (HID PID) ----------
 
-    def _wb_send_command(self, cmd):
+    def _wb_require_connected(self):
         if not self.wb_connected:
             self._notify("The wheelbase isn't connected.", "warn")
+        return self.wb_connected
+
+    def _wb_send_command(self, cmd):
+        if self._wb_require_connected():
+            self.wb_cmd_queue.put(cmd)
+
+    def _wb_write(self, name, value):
+        """Write one setting to the board's RAM (see the note above
+        WB_SLIDER_SPECS)."""
+        if self.wb_connected:
+            self.wb_cmd_queue.put(("send_setting", name, value))
+            if not self._wb_unsaved:
+                self._wb_unsaved = True
+                self._update_wb_status()
+
+    def _wb_verify(self, name, value):
+        """Read the board back after a change: FFBeast silently ignores some
+        writes (on RC.26.1.1 in free mode, the three DirectX strengths), and
+        the page should show what the board really has."""
+        if self.wb_connected:
+            self.wb_cmd_queue.put(("verify", name, value))
+
+    def _update_wb_status(self):
+        if not hasattr(self, "wb_status_label"):
             return
-        self.wb_cmd_queue.put(cmd)
+        if not FFBEAST_AVAILABLE:
+            text, color = "Wheelbase support couldn't load - see the log", T.STATUS_ERROR
+        elif not self.wb_connected:
+            text, color = "Looking for the wheelbase...", T.TEXT_SECONDARY
+        elif self._wb_unsaved:
+            text, color = "Changed, not saved - Save & Reboot keeps the changes after a restart", T.STATUS_WARN
+        else:
+            text, color = "Connected - showing the wheelbase's own settings", T.STATUS_OK
+        self.wb_status_label.config(text=text, fg=color)
+        self._wb_save_btn.set_enabled(self.wb_connected)
+
+    def _wb_worker_loop(self):
+        """Owns the hid.device for the app's whole lifetime - hidapi handles
+        aren't meant to be shared between threads - so the UI's commands
+        (wb_cmd_queue) and the live position stream both go through here.
+        Results go back to the UI thread through wb_status_queue."""
+        wb = volgas_ffbeast_api.FFBeastWheel()
+        stop = self._wb_stop
+        while not stop.is_set():
+            if not wb.connected:
+                try:
+                    if not wb.connect():
+                        stop.wait(1.0)
+                        continue
+                    settings = {**wb.read_effect_settings(), **wb.read_hardware_settings()}
+                except Exception as e:
+                    wb.close()
+                    log.info("wheelbase not ready: %s", e)
+                    stop.wait(1.0)
+                    continue
+                log.info("wheelbase connected: %s", settings)
+                # Anything queued while disconnected was meant for the old
+                # connection's state.
+                self._drain(self.wb_cmd_queue)
+                self.wb_status_queue.put(("connected", settings))
+            try:
+                while True:
+                    try:
+                        cmd = self.wb_cmd_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    self._wb_run_command(wb, cmd)
+                state = wb.read_state(timeout_ms=20)
+                if state:
+                    self.wb_status_queue.put(("state", state))
+            except Exception as e:
+                # Save & Reboot lands here too: the board drops off USB as it
+                # restarts, and the loop reconnects once it's back.
+                log.info("wheelbase disconnected: %s", e)
+                wb.close()
+                self.wb_status_queue.put(("disconnected", str(e)))
+                stop.wait(1.0)
+        wb.close()
+
+    @staticmethod
+    def _drain(q):
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _wb_run_command(self, wb, cmd):
+        kind = cmd[0]
+        if kind == "send_setting":
+            _, name, value = cmd
+            wb.send_setting(name, value)
+        elif kind == "save_and_reboot":
+            log.info("wheelbase: save and reboot")
+            wb.save_and_reboot()
+            self.wb_status_queue.put(("saved",))
+        elif kind == "reset_center":
+            wb.reset_center()
+        elif kind in ("read_settings", "verify"):
+            if kind == "verify":
+                self._wb_stop.wait(0.05)  # give the board a moment to apply the write
+            settings = {**wb.read_effect_settings(), **wb.read_hardware_settings()}
+            if kind == "verify" and settings.get(cmd[1]) != cmd[2]:
+                log.info("wheelbase kept %s=%s, ignoring the write of %s", cmd[1], settings.get(cmd[1]), cmd[2])
+                self.wb_status_queue.put(("rejected", cmd[1]))
+            self.wb_status_queue.put(("settings", settings))
+
+    def _wb_poll(self):
+        # The board streams its state much faster than this runs: keep only
+        # the newest one, so the wheel photo is rotated at most once per poll
+        # however many arrived (rotating for every one once backed the queue
+        # up until the app stopped responding).
+        latest_state = None
+        changed = False
+        try:
+            while True:
+                msg = self.wb_status_queue.get_nowait()
+                kind = msg[0]
+                if kind == "state":
+                    latest_state = msg[1]
+                elif kind == "connected":
+                    self.wb_connected = True
+                    self._wb_unsaved = False
+                    self._adopt_wb_settings(msg[1])
+                    changed = True
+                elif kind == "settings":
+                    self._adopt_wb_settings(msg[1])
+                elif kind == "rejected":
+                    self._notify(f"The wheelbase didn't accept the change to {_wb_display_name(msg[1])} and kept "
+                                 "its own value. FFBeast's free mode may lock this setting.", "warn")
+                elif kind == "saved":
+                    self._wb_unsaved = False
+                    changed = True
+                    self._notify("Saved to the wheelbase. It restarts and reconnects in a few seconds.", "info")
+                elif kind == "disconnected":
+                    self.wb_connected = False
+                    self._wb_fw = None
+                    changed = True
+        except queue.Empty:
+            pass
+        if changed:
+            self._update_wb_status()
+        if latest_state is not None:
+            self._wb_fw = "{ReleaseMajor}.{ReleaseMinor}.{ReleasePatch}".format(**latest_state)
+            self._update_main_wheel(latest_state["Position"])
+        if not self._closing:
+            self.root.after(16, self._wb_poll)
+
+    def _adopt_wb_settings(self, settings):
+        """Show the board's own values and remember the ones Volgas displays."""
+        self._on_wb_settings(settings)
+        shown = {n: v for n, v in settings.items() if n in getattr(self, "wb_field_vars", {}) or n in
+                 ("ForceEnabled", "PowerLimit", "MotionRange")}
+        if any(self._wb_remembered.get(n) != v for n, v in shown.items()):
+            self._wb_remembered.update(shown)
+            _save_settings(self._wb_settings)
 
     def _on_wb_settings(self, settings):
-        """Populate the Wheelbase tab's sliders and sync the Main tab's
-        Forces Enabled / Force Strength / Max steering angle controls from a
-        real read_effect_settings()+read_hardware_settings() dict (or a
-        single field just changed on the Wheelbase tab)."""
+        """Show wheelbase values on every control for them (the Wheelbase
+        page and Home's range and power rows) from a real
+        read_effect_settings()+read_hardware_settings() dict, or a single
+        field just changed on one of them."""
         for name, value in settings.items():
-            var = self.wb_field_vars.get(name)
-            if var is not None:
-                var.set(value)
+            for var in self.wb_field_vars.get(name, ()):
+                if var.get() != value:
+                    var.set(value)
         if "ForceEnabled" in settings:
             self.main_forces_enabled_var.set(bool(settings["ForceEnabled"]))
             self._redraw_forces_toggle()
@@ -2721,52 +3079,84 @@ class VolgasApp:
 
     # ---------- live status (title bar pills, Home cards) ----------
 
-    GAME_NAMES = {"rf2": "rFactor 2", "forza": "Forza Horizon"}
+    GAME_NAMES = {"rf2": "rFactor 2", "ac": "Assetto Corsa", "forza": "Forza Horizon"}
     STATUS_POLL_MS = 250
+
+    def _device_states(self):
+        """{device: (kind, text, connected)} for every device, the one source
+        for the title-bar pills, the Home cards and the Updates page.
+        `connected` devices have nothing to report, so their pills are hidden
+        (user, 2026-11-13: link status only shows while disconnected)."""
+        now = time.monotonic()
+        states = {}
+        if self.ser is None:
+            states["pedals"] = ("idle", "Pedals not found", False)
+        elif self.last_status is None or now - getattr(self, "last_status_time", 0) > 1.0:
+            states["pedals"] = ("warn", "Pedals not responding", False)
+        else:
+            states["pedals"] = ("ok", "Pedals connected", True)
+
+        bridge = self._dash_bridge
+        if bridge is None:
+            states["dash"] = ("error", "Dash unavailable", False)
+            states["hub"] = ("error", "Hub unavailable", False)
+        elif not bridge.connected:
+            states["dash"] = ("idle", "Dash not found", False)
+            states["hub"] = ("idle", "Hub not found", False)
+        elif bridge.is_hub:
+            states["hub"] = ("ok", "Hub connected", True)
+            if bridge.hub_status[1]["linked"]:
+                states["dash"] = ("ok", "Dash connected", True)
+            else:
+                states["dash"] = ("warn", "Dash not linked", False)
+        elif now - bridge.connected_at < 3.0:
+            # The hub hasn't answered yet; don't flash "hub not found".
+            states["hub"] = ("idle", "Hub connecting", True)
+            states["dash"] = ("ok", "Dash connected", True)
+        else:
+            # A dash plugged straight into the PC (no hub).
+            states["hub"] = ("idle", "Hub not found", False)
+            states["dash"] = ("ok", "Dash connected", True)
+
+        if FFBEAST_AVAILABLE:
+            states["wheelbase"] = (("ok", "Wheelbase connected", True) if self.wb_connected
+                                   else ("idle", "Wheelbase not found", False))
+        return states
 
     def _status_poll(self):
         if self._closing:
             return
         now = time.monotonic()
-        # Pedals
-        if self.ser is None:
-            pedal = ("idle", "Pedals not found")
-            note = "Plug in the pedals - Volgas finds them automatically"
-        elif self.last_status is None or now - getattr(self, "last_status_time", 0) > 1.0:
-            pedal = ("warn", "Pedals not responding")
-            note = "Connected, but no readings yet"
-        else:
-            pedal = ("ok", "Pedals connected")
-            note = "Calibration loaded" if self._cal_loaded else "Reading calibration..."
-        self._pedal_pill.set(*pedal)
+        states = self._device_states()
+        # Device pills: only while the device is disconnected.
+        self._apply_title_pills({k for k, (_kind, _text, ok) in states.items() if not ok})
+        for key, pill in self._title_pills.items():
+            kind, text, _ok = states[key]
+            pill.set(kind, text)
+        pedal, dash = states["pedals"], states["dash"]
         self._home_pedal_pill.set(pedal[0], pedal[1].replace("Pedals ", "").capitalize())
-        self._home_pedal_note.config(text=note)
+        self._show_card_pill(self._home_pedal_pill, not pedal[2])
 
         # Dash and game
         bridge = self._dash_bridge
-        game_kind, game_text = "idle", "No game"
-        if bridge is None:
-            dash = ("error", "Dash unavailable")
-            dash_note, detail = "See the log file for details", "--"
-        elif not bridge.connected:
-            dash = ("idle", "Dash not found")
-            dash_note, detail = "Plug in the dash - Volgas finds it automatically", "--"
-        else:
-            dash = ("ok", "Dash connected")
-            dash_note = "Clock synced" if bridge.time_synced else "Syncing the clock..."
+        game_kind, game_text, detail = "idle", "No game", "--"
+        if bridge is not None and bridge.connected:
             src = getattr(bridge, "active_source", None)
             if src and now - src[0] < 1.5:
                 game_kind, game_text = "info", self.GAME_NAMES.get(src[1], src[1])
-                detail = "Gear, speed, RPM" + (", lap time and delta" if src[1] == "rf2" else "")
+                detail = "Gear, speed, RPM" + (", lap time and delta" if src[1] in ("rf2", "ac") else "")
             else:
                 detail = "Clock and date (standby)"
-        self._dash_pill.set(*dash)
         self._game_pill.set(game_kind, game_text)
         self._home_dash_pill.set(dash[0], dash[1].replace("Dash ", "").capitalize())
+        self._show_card_pill(self._home_dash_pill, not dash[2])
+        # The wheel's own radio link (wheel <-> hub), on the wheel card.
+        hub = states["hub"]
+        self._home_wheel_pill.set("warn" if hub[2] else "idle", "Not linked" if hub[2] else "No hub")
+        self._show_card_pill(self._home_wheel_pill, not dash[2])
         self._home_game_label.config(text=game_text if game_kind != "idle" else "None detected",
                                      fg=T.TEXT_PRIMARY if game_kind != "idle" else T.TEXT_HINT)
         self._home_dash_detail.config(text=detail)
-        self._home_dash_note.config(text=dash_note)
         if self._tab_frames["Home"].winfo_ismapped():
             state = self._dash_preview_state()
             if state != self._home_dash_shown:
@@ -2777,6 +3167,260 @@ class VolgasApp:
                 self._home_dash_photo = ImageTk.PhotoImage(image)
                 self._home_dash_image.config(image=self._home_dash_photo)
         self.root.after(self.STATUS_POLL_MS, self._status_poll)
+
+    # ---------- updates page (firmware for every device) ----------
+
+    # Devices Volgas can't update itself yet: the card and the check are
+    # there, the Update button is disabled (user, 2026-11-13).
+    UPDATE_LATER = "updating this from Volgas comes later"
+
+    def _build_updates_tab(self, parent):
+        """One card per thing that has software: the Volgas app (updated in
+        Settings, so its card only links there) and each device. A card shows
+        the installed version, the result of the last check, a Check button
+        and an Update button; Check all at the top."""
+        self._dev_ui = {}
+        root = tk.Frame(parent, bg=MAIN_BG)
+        root.pack(fill="both", expand=True, padx=px(20), pady=(px(12), px(8)))
+        top = tk.Frame(root, bg=MAIN_BG)
+        top.pack(fill="x", pady=(0, T.SPACE_2))
+        tk.Label(top, text="Firmware for each device.", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY,
+                 bg=MAIN_BG).pack(side="left")
+        ui.FlatButton(top, "Check all", command=self._check_all_updates, variant="primary",
+                      font=T.FONT_CAPTION).pack(side="right")
+        for key in devs.DEVICES:
+            if key != "wheelbase" or FFBEAST_AVAILABLE:
+                self._build_update_card(root, key, devs.DEVICE_NAMES[key])
+
+    def _build_update_card(self, parent, key, name):
+        card, inner = self._make_frame_card(parent, 520, 96)
+        card.pack(fill="x", pady=(0, T.SPACE_2))
+        left = tk.Frame(inner, bg=MAIN_PANEL)
+        left.pack(side="left", fill="both", expand=True)
+        head = tk.Frame(left, bg=MAIN_PANEL)
+        head.pack(anchor="w")
+        tk.Label(head, text=name, font=T.FONT_TITLE, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL).pack(side="left")
+        pill = ui.StatusPill(head, "idle", "", bg=MAIN_PANEL)   # packed only while the device is disconnected
+        info = tk.Label(left, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL, anchor="w")
+        info.pack(anchor="w", pady=(px(2), 0))
+        result = tk.Label(left, text="", font=T.FONT_CAPTION, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL, anchor="w")
+        result.pack(anchor="w")
+        right = tk.Frame(inner, bg=MAIN_PANEL)
+        right.pack(side="right")
+        buttons = tk.Frame(right, bg=MAIN_PANEL)
+        buttons.pack()
+        ui_ = {"pill": pill, "pill_shown": False, "info": info, "result": result, "buttons": buttons}
+        ui_["file"] = None
+        if key == "dash":
+            ui_["file"] = ui.FlatButton(buttons, "From file...", command=self._update_dash_from_file,
+                                        font=T.FONT_CAPTION)
+            ui_["file"].pack(side="left", padx=(0, T.SPACE_2))
+        ui.FlatButton(buttons, "Check", command=lambda: self._check_updates({key}),
+                      font=T.FONT_CAPTION).pack(side="left")
+        ui_["update"] = ui.FlatButton(buttons, "Update", command=lambda: self._install_device_update(key),
+                                      variant="primary", font=T.FONT_CAPTION)
+        ui_["update"].pack(side="left", padx=(T.SPACE_2, 0))
+        ui_["bar"] = ttk.Progressbar(right, length=px(200), maximum=100)   # only while updating
+        self._dev_ui[key] = ui_
+
+    def _device_versions(self):
+        """The firmware version each connected device reports (None = not
+        connected or doesn't report one)."""
+        versions = {key: None for key in devs.DEVICES}
+        bridge = self._dash_bridge
+        if bridge is not None and bridge.is_hub and bridge.hub_status[1]["linked"]:
+            versions["dash"] = bridge.hub_status[1]["fw"] or None
+        if self.wb_connected:
+            versions["wheelbase"] = self._wb_fw
+        return versions
+
+    def _check_text(self, key, installed):
+        """The result line of a device card."""
+        if self._dev_text.get(key):
+            return self._dev_text[key]
+        if self._dev_error and key in self._dev_checked:
+            return f"Couldn't check: {self._dev_error}"
+        if key not in self._dev_checked or self._dev_manifest is None:
+            return "Not checked yet"
+        entry = self._dev_manifest.get(key)
+        if entry is None:
+            return "No firmware published yet"
+        outcome = devs.compare(installed, entry["version"])
+        if outcome == devs.UPDATE:
+            return f"Update available: firmware {entry['version']}"
+        if outcome == devs.CURRENT:
+            return "Up to date"
+        if outcome == devs.NEWER:
+            return f"Newer than the published firmware ({entry['version']})"
+        return f"Latest published: firmware {entry['version']}"
+
+    def _update_available(self, key, installed):
+        entry = (self._dev_manifest or {}).get(key)
+        return (key in self._dev_checked and entry is not None
+                and devs.compare(installed, entry["version"]) == devs.UPDATE)
+
+    def _refresh_updates_page(self):
+        states = self._device_states()
+        versions = self._device_versions()
+        release = getattr(self, "_latest_release", None)
+        any_update = bool(release) and _version_tuple(release[0]) > _version_tuple(VOLGAS_VERSION)
+        for key, ui_ in self._dev_ui.items():
+            kind, text, connected = states[key]
+            if connected == ui_["pill_shown"]:   # shown exactly while disconnected
+                if connected:
+                    ui_["pill"].pack_forget()
+                else:
+                    ui_["pill"].pack(side="left", padx=(T.SPACE_3, 0))
+                ui_["pill_shown"] = not connected
+            ui_["pill"].set(kind, text.replace(devs.DEVICE_NAMES[key] + " ", "").capitalize())
+            installed = versions[key]
+            if not connected:
+                info = "Not connected"
+            elif installed is not None:
+                info = f"Installed: firmware {installed}"
+            else:
+                info = "Installed: version not reported"
+            if key not in devs.UPDATABLE:
+                info += f"  \u00b7  {self.UPDATE_LATER}"
+            ui_["info"].config(text=info)
+            ui_["result"].config(text=self._check_text(key, installed))
+            can = (key in devs.UPDATABLE and connected and not self._dev_update_busy
+                   and self._update_available(key, installed))
+            ui_["update"].set_enabled(can)
+            any_update = any_update or (self._update_available(key, installed) and key in devs.UPDATABLE)
+            if ui_["file"] is not None:
+                ui_["file"].set_enabled(connected and not self._dev_update_busy)
+            busy = self._dev_update_busy and key == "dash"
+            if busy and not ui_["bar"].winfo_ismapped():
+                ui_["buttons"].pack_forget()
+                ui_["bar"].pack()
+            elif not busy and ui_["bar"].winfo_ismapped():
+                ui_["bar"].pack_forget()
+                ui_["buttons"].pack()
+        if hasattr(self, "_nav"):
+            self._nav.set_badge("Settings", any_update)   # the app or a device has an update
+
+    def _updates_poll(self):
+        """Worker messages and the page's live values, on the UI thread."""
+        if self._closing:
+            return
+        try:
+            while True:
+                msg = self._dev_queue.get_nowait()
+                kind = msg[0]
+                if kind == "manifest":
+                    self._dev_busy = False
+                    self._dev_manifest = msg[1]
+                    self._dev_error = None
+                elif kind == "check_error":
+                    self._dev_busy = False
+                    err = msg[1]
+                    self._dev_error = ("no public release found" if isinstance(err, urllib.error.HTTPError)
+                                       and err.code == 404 else str(err))
+                    log.info("device update check failed: %s", err)
+                elif kind == "progress":   # (progress, fraction, text)
+                    self._dev_text["dash"] = msg[2]
+                    self._dev_ui["dash"]["bar"].config(value=msg[1] * 100)
+                elif kind == "done":       # (done, old, new)
+                    self._dev_update_busy = False
+                    self._dev_text.pop("dash", None)
+                    self._notify(f"Dash updated: firmware {msg[1]} to {msg[2]}.", "info")
+                elif kind == "failed":     # (failed, text)
+                    self._dev_update_busy = False
+                    self._dev_text.pop("dash", None)
+                    self._notify(f"Dash update failed: {msg[1]}", "error")
+        except queue.Empty:
+            pass
+        self._refresh_updates_page()   # also keeps the nav badge current from any page
+        self.root.after(150 if self._dev_update_busy else 500, self._updates_poll)
+
+    def _check_all_updates(self):
+        self._start_update_check()
+        self._check_updates(set(devs.DEVICES))
+
+    def _check_updates(self, keys=None):
+        """Fetch the latest release's firmware list and show how each of the
+        given devices compares (all of them if none are named). One download
+        covers every device; only the named cards show their result."""
+        if self._dev_busy:
+            return
+        self._dev_busy = True
+        self._dev_checked |= set(keys or devs.DEVICES)
+        self._dev_error = None
+
+        def work():
+            try:
+                self._dev_queue.put(("manifest", devs.fetch_manifest(_http_get, UPDATE_API_URL)))
+            except Exception as e:
+                self._dev_queue.put(("check_error", e))
+
+        threading.Thread(target=work, daemon=True, name="device-update-check").start()
+
+    def _install_device_update(self, key):
+        if key != "dash":
+            return
+        entry = (self._dev_manifest or {}).get("dash")
+        if entry is None:
+            return
+        self._start_dash_update(f"firmware {entry['version']}", entry=entry)
+
+    def _update_dash_from_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Dash firmware", filetypes=[("Firmware", "*.bin"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                image = f.read()
+        except OSError as e:
+            self._notify(f"Couldn't read the file ({e}).", "error")
+            return
+        self._start_dash_update(os.path.basename(path), image=image)
+
+    def _start_dash_update(self, what, entry=None, image=None):
+        """Send firmware to the wheel through the hub. The dash bridge lets go
+        of the hub's port for the duration (it normally holds it)."""
+        bridge = self._dash_bridge
+        if self._dev_update_busy or bridge is None:
+            return
+        if not (bridge.is_hub and bridge.hub_status[1]["linked"]):
+            self._notify("The hub isn't linked to the wheel, so the dash can't be updated wirelessly.", "warn")
+            return
+        if not messagebox.askyesno(
+                "Update dash", f"Send {what} to the dash through the hub?\n\nThe car must be parked. The dash "
+                               "shows its progress and restarts when it's done; this takes a few minutes."):
+            return
+        self._dev_update_busy = True
+        self._dev_text["dash"] = "Starting..."
+        port = bridge.port
+
+        def work():
+            try:
+                data = image
+                if data is None:
+                    self._dev_queue.put(("progress", 0.0, "Downloading..."))
+                    data = devs.download_firmware(_http_get, entry)
+                self._dev_queue.put(("progress", 0.0, "Waiting for the hub's port..."))
+                if not bridge.pause():
+                    raise volgas_wheel_ota.OtaError("couldn't free the hub's port")
+                try:
+                    last = [-1]
+
+                    def progress(done, total):
+                        if done * 100 // total != last[0]:
+                            last[0] = done * 100 // total
+                            self._dev_queue.put(("progress", done / total, f"Sending... {last[0]}%"))
+
+                    old, new = volgas_wheel_ota.update_wheel(data, port=port, progress=progress, log=log.info)
+                finally:
+                    bridge.resume()
+                self._dev_queue.put(("done", old, new))
+            except Exception as e:
+                log.exception("dash update failed")
+                self._dev_queue.put(("failed", str(e)))
+
+        threading.Thread(target=work, daemon=True, name="dash-update").start()
 
     # ---------- shutdown ----------
 
@@ -2789,11 +3433,13 @@ class VolgasApp:
         self._closing = True
         log.info("closing")
         self._bridge_stop.set()
+        self._wb_stop.set()
         self._disconnect("app closing")
-        if self._bridge_thread is not None:
-            self._bridge_thread.join(timeout=2.0)
-            if self._bridge_thread.is_alive():
-                log.warning("dash bridge did not stop within 2 s")
+        for thread, name in ((self._bridge_thread, "dash bridge"), (self._wb_thread, "wheelbase")):
+            if thread is not None:
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    log.warning("%s did not stop within 2 s", name)
         self.root.destroy()
 
     def _on_calibration(self, cal):

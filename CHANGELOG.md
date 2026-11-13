@@ -1,9 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-13)
 
+### Interface
 - Sharp on laptops with display scaling (125%, 150%...): Volgas now handles the scaling itself instead of letting Windows stretch the window, which made everything fuzzy. Text, controls, gauges, curves, the wheel photo and the dash preview are drawn at the screen's real resolution, at the same size as before. At 100% nothing changes. `VOLGAS_UI_SCALE=1.5` (environment variable) previews the scaled layout on any computer, e.g. with `tools/simulate.py`.
 - New installer, `VolgasSetup.exe`: installs for your Windows account without admin rights, adds a Start menu entry, and lists Volgas under Settings → Apps with an Uninstall button. The in-app updater keeps working, and the installed-apps entry follows its updates. `Volgas.exe` on its own still works.
+
+### Hub and wheel (firmware: needs flashing over USB once)
+- New hub (`hub_s3`, an ESP32-S3 on the PC's USB) and a wheel that talks to it wirelessly (ESP-NOW, `esp32_dash`, the old dash board moved onto the wheel). Volgas sends the dash data to the hub exactly as before; the hub forwards it to the wheel's display. The wheel's buttons go to the hub, which shows up in Windows as the game controller "Volgas Hub" (12 buttons in a 4x3 diode matrix; not wired or tested yet).
+- The wheel can be updated over the radio, with no cable: it writes the new firmware into a spare slot, checks it, and goes back to the previous version by itself if the new one doesn't connect to the hub.
+- The display backlight is on its own pin (GPIO7) and only switches on once the logo is drawn, which removes the white flash at power-on. The standby screen shows "hub: lost" only while the link is down, and the clock stays centred.
+- The old nRF24 receiver and the dash's own USB game controller are gone from the wheel firmware.
+
+### Device updates
+- Settings now has two sections, switched at the top: **Volgas** (the app's own update and the support info) and **Device updates**, with a card for the dash, the hub, the pedals and the wheelbase. Each card shows what's installed and the result of its last check, with its own **Check** and **Update** buttons, plus **Check all** at the top. The Settings item in the left bar shows a dot when the app or a device has an update.
+- Checks read a `firmware.json` published with the latest GitHub release (version, file and SHA-256 per device); a release without one means no firmware has been published yet.
+- The dash updates wirelessly through the hub, from the release or from a .bin file (From file...). Volgas pauses the dash feed for the update and shows the progress on the card. The pedals, hub and wheelbase have their cards and checks; updating them from Volgas comes later.
+- Link status only shows while a device is disconnected: the title-bar pills (dash, hub, pedals, wheelbase), the Home card pills and the wheel's radio link pill are hidden when everything is connected. There's a new Hub pill, and Volgas now asks the hub for the wheel's link and firmware version.
+
+### Dash
+- Assetto Corsa support: speed, gear, RPM and the rev limit, plus lap time and a live delta to your best lap, read from the game's own shared memory (nothing to set up in the game). A lap with more than two tyres off the track shows as invalid.
+- Lap time and delta (rFactor 2 and Assetto Corsa) appear once the game has counted the first completed lap: the out lap isn't shown, and neither is the "lap" timer on maps without a start/finish line (e.g. No Hesi), which only counts time since joining.
+
+### Wheelbase (FFBeast)
+- FFBeast support is back: the Wheelbase page is shown again, finds the wheelbase automatically, and the wheel photos turn with the real wheel. A title bar pill shows whether it's connected.
+- The wheelbase is the source of truth: on connect Volgas shows the board's own settings instead of pushing remembered ones onto it (a new board would otherwise get the old board's values).
+- New Forces switch on the Wheelbase page.
+- Home's wheel card shows the steering angle and has Steering Range and Power sliders with 360°/540°/900° presets, kept in step with the Wheelbase page. The explanatory lines under the Home cards are gone.
+- The wheel photo is only redrawn when the angle changes, with a cheaper rotation while it moves; a large window no longer makes Volgas lag. Home's Pedals and Dash cards are drawn on one canvas each, so resizing is quicker.
+- Every change is read back from the board; a change the board refuses springs back with a notice (on FFBeast RC.26.1.1 in free mode, the three DirectX strengths are locked).
+- The page says when there are changes that haven't been saved to the wheelbase yet.
+- Tested against an ODESC 4.2 on FFBeast RC.26.1.1.
 
 ## 0.3.0 (2026-11-11)
 

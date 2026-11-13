@@ -17,9 +17,9 @@ box steering wheel and a small dash display.
 - **Home**: the whole rig at a glance - the steering wheel, live throttle and brake, and the dash with the game it's showing. Every card shows whether its device is connected.
 - **Pedals**: live readings, a guided calibration wizard and response curves, with a marker showing where each pedal is on its curve right now. The pedals are found automatically over USB.
 - **Dash**: a live picture of what the dash screen is showing.
-- **Dash bridge**: runs in the background and sends rFactor 2 or Forza Horizon 5 telemetry to the dash, whichever game is running.
-- **Settings** (bottom of the left bar): the version, updates, and where Volgas keeps its settings and log files.
-- **Wheelbase**: hidden until wheelbase support exists (it will come with Volgas's own wheelbase firmware). Settings → Support can show it again.
+- **Dash bridge**: runs in the background and sends rFactor 2, Assetto Corsa or Forza Horizon 5 telemetry to the dash, whichever game is running.
+- **Settings** (bottom of the left bar): the app's version and updates, where Volgas keeps its settings and log files, and a **Device updates** section with firmware for each device (dash, hub, pedals, wheelbase) and a check for each and for all of them. The dash updates wirelessly through the hub; the others come later.
+- **Wheelbase**: settings for an FFBeast wheelbase - forces on/off, rotation range, effect strengths, gains and power limit - plus Set Centre and the live wheel angle. Changes apply straight away; **Save & Reboot** stores them on the wheelbase. Settings → Support can hide the page.
 
 The title bar always shows whether the pedals and dash are connected and which game is running.
 
