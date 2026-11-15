@@ -34,6 +34,7 @@ Usage: python volgas_dash_bridge.py
 Requires: pip install pyserial
 """
 import logging
+import queue
 import struct
 import sys
 import threading
@@ -43,7 +44,8 @@ import serial
 import serial.tools.list_ports
 
 from volgas_forza_telemetry import ForzaUDPReader
-from volgas_wheel_ota import FrameReader, USB_WHEEL_INFO, USB_WHEEL_STATUS
+from volgas_wheel_ota import (FrameReader, USB_WHEEL_INFO, USB_WHEEL_STATUS, USB_BTN_MAP_GET, USB_BTN_MAP_SET,
+                              USB_BTN_MAP, USB_BUTTONS)
 
 try:
     from volgas_rf2_telemetry import RF2SharedMemoryReader
@@ -93,7 +95,11 @@ RF2_RETRY_PERIOD_S = 2   # how often to retry opening rF2's shared memory while 
 # ever completed, so the game's lap timer is just time since joining. Lap
 # timing still runs in the background meanwhile.
 FIRST_SHOWN_LAP = 1
-HUB_STATUS_PERIOD_S = 1.0   # how often the hub is asked for the wheel's link status
+HUB_POLL_S = 0.002          # how often the hub's USB port is serviced between telemetry frames
+HUB_STATUS_PERIOD_S = 1.0   # how often a port that hasn't answered yet is asked for the wheel's status
+HUB_BUTTON_POLL_S = 0.01    # once it's a known hub: how often it's asked (the answer carries the buttons). The hub's
+                            # own button pushes can't be relied on: it only sends them while its core thinks the port
+                            # is open, which depends on how Windows toggled DTR/RTS when opening it.
 HUB_STATUS_STALE_S = 4.0    # no answer for this long -> not a hub (or the hub is gone)
 
 
@@ -149,13 +155,56 @@ class DashBridge:
         # Latest answer to our wheel-status request: (time.monotonic(), {"linked", "model", "fw", "buttons",
         # "rssi"}). Only the hub answers; a wheel plugged in directly ignores the request.
         self.hub_status = None
+        # The wheel's buttons as the hub last reported them: (time.monotonic(), raw, mapped), raw being one bit per
+        # matrix position and mapped the button numbers after the hub's map. None until a hub with the button
+        # firmware has reported (an older hub never does). hub_btn_map is the hub's map, raw bit -> button number.
+        self.hub_buttons = None
+        self.hub_btn_map = None
+        self._to_hub = queue.Queue()   # frames for the hub, written by the bridge thread (the port's only user)
         self._pause_req = threading.Event()
         self._paused_ack = threading.Event()
+        self._last_status_request = -1e9
 
     @property
     def is_hub(self):
         s = self.hub_status
         return self.connected and s is not None and time.monotonic() - s[0] < HUB_STATUS_STALE_S
+
+    def _service_hub(self, ser, hub_reader):
+        """Ask the hub for the wheel's status when due, write the frames queued
+        for the hub and handle whatever it has sent."""
+        now = time.perf_counter()   # time.monotonic() only ticks every 15.6 ms on Windows
+        if now - self._last_status_request >= (HUB_BUTTON_POLL_S if self.is_hub else HUB_STATUS_PERIOD_S):
+            self._last_status_request = now
+            ser.write(build_frame(USB_WHEEL_INFO, b""))
+        try:
+            while True:
+                msg_type, payload = self._to_hub.get_nowait()
+                ser.write(build_frame(msg_type, payload))
+        except queue.Empty:
+            pass
+        if ser.in_waiting:
+            for msg_type, payload in hub_reader.feed(ser.read(ser.in_waiting)):
+                self._on_hub_frame(msg_type, payload)
+
+    def send_to_hub(self, msg_type, payload=b""):
+        """Queue a frame for the hub; it's written by the bridge thread."""
+        self._to_hub.put((msg_type, bytes(payload)))
+
+    def _on_hub_frame(self, msg_type, payload):
+        now = time.monotonic()
+        if msg_type == USB_WHEEL_STATUS and len(payload) >= 6:
+            linked, model, fw, buttons, rssi = struct.unpack("<BBHBb", payload[:6])
+            self.hub_status = (now, {"linked": bool(linked), "model": model, "fw": fw, "buttons": buttons,
+                                     "rssi": rssi})
+            if len(payload) >= 14:
+                raw, mapped = struct.unpack("<II", payload[6:14])
+                self.hub_buttons = (now, raw, mapped)
+        elif msg_type == USB_BUTTONS and len(payload) >= 8:
+            raw, mapped = struct.unpack("<II", payload[:8])
+            self.hub_buttons = (now, raw, mapped)
+        elif msg_type == USB_BTN_MAP and len(payload) == 32:
+            self.hub_btn_map = list(payload)
 
     def pause(self, timeout=5.0):
         """Let go of the serial port (e.g. for a wheel firmware update).
@@ -206,7 +255,8 @@ class DashBridge:
                 self.connected_at = time.monotonic()
                 self.port = port
                 hub_reader = FrameReader()
-                last_status_request = 0.0
+                self._last_status_request = -1e9
+                last_map_request = 0.0
                 send_time_sync_burst(ser, stop_event)
                 self.time_synced = True
                 last_time_sync = time.time()
@@ -234,19 +284,13 @@ class DashBridge:
                 while not stop_event.is_set() and not self._pause_req.is_set():
                     start = time.time()
 
-                    # The hub answers this with its wheel status; a wheel on
-                    # USB ignores it. Replies are read here (nothing else
-                    # reads this port).
-                    if start - last_status_request >= HUB_STATUS_PERIOD_S:
-                        last_status_request = start
-                        ser.write(build_frame(USB_WHEEL_INFO, b""))
-                    if ser.in_waiting:
-                        for msg_type, payload in hub_reader.feed(ser.read(ser.in_waiting)):
-                            if msg_type == USB_WHEEL_STATUS and len(payload) >= 6:
-                                linked, model, fw, buttons, rssi = struct.unpack("<BBHBb", payload[:6])
-                                self.hub_status = (time.monotonic(), {
-                                    "linked": bool(linked), "model": model, "fw": fw, "buttons": buttons,
-                                    "rssi": rssi})
+                    # _service_hub asks for the wheel status (the hub answers, a
+                    # wheel on USB ignores it) and reads the replies (nothing
+                    # else reads this port).
+                    if self.is_hub and self.hub_btn_map is None and start - last_map_request >= 2.0:
+                        last_map_request = start
+                        ser.write(build_frame(USB_BTN_MAP_GET, b""))
+                    self._service_hub(ser, hub_reader)
 
                     if RF2_AVAILABLE and rf2_reader is None and start - last_rf2_attempt >= RF2_RETRY_PERIOD_S:
                         last_rf2_attempt = start
@@ -372,8 +416,15 @@ class DashBridge:
 
                     elapsed = time.time() - start
                     remaining = period - elapsed
-                    if remaining > 0:
-                        stop_event.wait(remaining)
+                    # Wait out the rest of this frame, but keep talking to the hub meanwhile: its button
+                    # reports and answers shouldn't wait for the next telemetry frame (50 ms).
+                    wake = time.time() + remaining
+                    while not stop_event.is_set() and not self._pause_req.is_set():
+                        left = wake - time.time()
+                        if left <= 0:
+                            break
+                        self._service_hub(ser, hub_reader)
+                        time.sleep(min(left, HUB_POLL_S))
             except (serial.SerialException, OSError) as e:
                 self.status_cb(f"lost connection to the dash ({e}) - reconnecting...")
                 log.info("dash connection lost: %s", e)
@@ -389,6 +440,8 @@ class DashBridge:
                 self.connected = False
                 self.time_synced = False
                 self.hub_status = None
+                self.hub_buttons = None
+                self.hub_btn_map = None
                 self.port = None
                 if ser:
                     ser.close()

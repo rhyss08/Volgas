@@ -67,6 +67,7 @@ from collections import deque
 from PIL import Image, ImageDraw, ImageTk
 
 import volgas_dash_font
+import volgas_buttons as vbtn
 import volgas_devices as devs
 import volgas_theme as T
 import volgas_ui as ui
@@ -284,6 +285,7 @@ WHEEL_IMAGE_NAME = "volgas_wheel.png"
 WHEEL_VERTICAL_OFFSET = 24  # px, nudges the photo down clear of the angle text above it
 WHEEL_RESIZE_THROTTLE_MS = 33
 WHEEL_SETTLE_MS = 150  # full-quality redraw this long after the wheel or the window stops changing
+WHEEL_BUTTONS = 12  # buttons on the wheel (the hub's hello says so too); the lights and the calibration cover these
 WHEEL_MIN_ANGLE_STEP = 0.1  # degrees; smaller position changes don't redraw the photo
 CARD_PAD = 16  # inset between a card's edge and its contents
 WHEEL_CENTRE_BUTTON_Y = CARD_PAD + 20 + 22  # top of Set Centre: just under the angle readout centred at CARD_PAD + 20
@@ -849,6 +851,16 @@ class VolgasApp:
         # on connect the board's own values replace them (see _wb_poll).
         self._wb_settings = _load_settings()
         self._wb_remembered = self._wb_settings.setdefault("wheelbase", {})
+        # Which part of the wheel photo each button is (volgas_buttons.PARTS: a round button's cap or a paddle),
+        # set by the button calibration; the photo's parts in order until then.
+        saved = self._wb_settings.get("wheel_button_parts")
+        self._btn_parts = list(saved) if vbtn.valid_parts(saved, WHEEL_BUTTONS) else list(vbtn.DEFAULT_PARTS)
+        old = self._wb_settings.get("wheel_button_positions")   # a build kept clicked positions instead, for a day
+        if saved is None and isinstance(old, list) and len(old) == WHEEL_BUTTONS:
+            try:
+                self._btn_parts = [vbtn.part_at(q[0], q[1], 0.08) for q in old]
+            except (TypeError, IndexError, ValueError):
+                pass
 
         # Layout: the title bar across the top (row 0), a navigation rail
         # down the left and the current page beside it (row 1). Pages are
@@ -861,7 +873,7 @@ class VolgasApp:
         content.grid_rowconfigure(0, weight=1)
         content.grid_columnconfigure(0, weight=1)
 
-        page_names = ["Home", "Pedals", "Dash"]
+        page_names = ["Home", "Pedals", "Wheel"]
         if self._show_wheelbase:
             # Settings -> Support can hide it ("show_wheelbase" in the
             # settings file).
@@ -879,6 +891,8 @@ class VolgasApp:
         self._dev_update_busy = False  # a wheel firmware update is running
         self._dev_text = {}            # device -> status text of the running/last update
         self._dev_queue = queue.Queue()
+        self._button_markers = []      # every WheelButtonMarkers on screen (Home wheel card, Wheel page)
+        self._shown_buttons = None
         self._update_queue = queue.Queue()
         self._update_busy = False
         self._dash_bridge = DashBridge() if DASH_BRIDGE_AVAILABLE else None
@@ -886,7 +900,7 @@ class VolgasApp:
         self._build_pedals_tab(self._tab_frames["Pedals"])
         if self._show_wheelbase:
             self._build_wheelbase_tab(self._tab_frames["Wheelbase"])
-        self._build_dashboard_tab(self._tab_frames["Dash"])
+        self._build_wheel_tab(self._tab_frames["Wheel"])
         self._build_settings_tab(self._tab_frames["Settings"])
         self._caption_hwnd = _hook_caption(self.root)
         self._build_window_chrome()
@@ -932,6 +946,7 @@ class VolgasApp:
             self._wb_thread = threading.Thread(target=self._wb_worker_loop, name="wheelbase", daemon=True)
             self._wb_thread.start()
         self._wb_poll()
+        self._buttons_poll()
         self._status_poll()
         self._remove_old_exe()
         if self._wb_settings.get("check_updates_on_start", True):
@@ -1115,7 +1130,7 @@ class VolgasApp:
             self._start_native_drag(hit, event)
             return "break"
 
-    PAGE_TITLES = {"Home": "Home", "Pedals": "Pedals", "Dash": "Dash", "Wheelbase": "Wheelbase",
+    PAGE_TITLES = {"Home": "Home", "Pedals": "Pedals", "Wheel": "Wheel", "Wheelbase": "Wheelbase",
 
                    "Settings": "Settings"}
 
@@ -1127,7 +1142,7 @@ class VolgasApp:
         self._nav.grid(row=1, column=0, sticky="ns")
         self._nav.add("Home", "Home", "home")
         self._nav.add("Pedals", "Pedals", "pedals")
-        self._nav.add("Dash", "Dash", "dash")
+        self._nav.add("Wheel", "Wheel", "wheel")
         if self._show_wheelbase:
             self._nav.add("Wheelbase", "Base", "base")
         self._nav.add("Settings", "Settings", "settings", bottom=True)
@@ -1320,7 +1335,7 @@ class VolgasApp:
         y += caption_h
         self._home_dash_detail = _CanvasText(card, card.create_text(
             x, y + LABEL_INSET, text="--", font=T.FONT_BODY, fill=T.TEXT_PRIMARY, anchor="nw", width=px(210)))
-        ui.FlatButton(footer, "Open dash", command=lambda: self._select_tab("Dash"),
+        ui.FlatButton(footer, "Open wheel", command=lambda: self._select_tab("Wheel"),
                       font=T.FONT_CAPTION).pack(side="right")
         return card
 
@@ -1494,6 +1509,7 @@ class VolgasApp:
 
         canvas = self._make_flat_card(parent, width, height, outline="" if wheelbase_controls else MAIN_BORDER)
         state = {"size": None, "base": None, "base_fast": False, "photo": None, "drawn": None, "settle": None}
+        markers = None   # the wheel's buttons drawn over the photo (Home only)
         # Without wheelbase controls (Home) the card has a title row, then the
         # steering range and power rows and a row of range presets and Set
         # Centre (_add_home_wheel_rows), and the angle readout sits under the photo.
@@ -1531,6 +1547,8 @@ class VolgasApp:
                 state["photo"] = ImageTk.PhotoImage(rotated)  # keep a reference - Tk drops GC'd images
                 canvas.itemconfig(image_id, image=state["photo"])
             canvas.itemconfig(text_id, text=f"{angle_deg:+.0f}°")
+            if markers is not None:   # the buttons turn with the photo
+                markers.place(*canvas.coords(image_id), state["size"], angle_deg)
 
         def settle():
             state["settle"] = None
@@ -1570,6 +1588,7 @@ class VolgasApp:
                 canvas.coords(image_id, w / 2, (header_h + h - footer_h) / 2)
                 canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + px(12))
                 canvas.coords(text_id, w / 2, h - footer_h / 2)
+                markers.place(w / 2, (header_h + h - footer_h) / 2, state["size"] or 0, self._last_wheel_angle)
             resize_soon()
 
         resize_photo(MAIN_WHEEL_CANVAS_SIZE, fast=False)
@@ -1586,6 +1605,9 @@ class VolgasApp:
             # The steering angle, under the photo.
             text_id = canvas.create_text(0, 0, text="+0\u00b0", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
             self._add_home_wheel_rows(canvas, title_h)
+            markers = ui.WheelButtonMarkers(canvas, WHEEL_BUTTONS, tag="wheel_buttons")
+            markers.set_parts(self._btn_parts)
+            self._button_markers.append(markers)
             canvas.bind("<Configure>", on_resize, add="+")
             self._wheel_cards.append((canvas, draw))
             return canvas
@@ -2275,24 +2297,79 @@ class VolgasApp:
         card.bind("<Enter>", lambda _e: card.focus_set(), add="+")
         self._update_wb_status()
 
-    def _build_dashboard_tab(self, parent):
-        """A live picture of the ESP32 dash's screen (see _render_dash), on a
-        flat card like the other pages."""
+    def _build_wheel_tab(self, parent):
+        """The Wheel page: the wheel with its buttons lit as they're pressed
+        (and the button calibration), beside a live picture of the dash's
+        screen (see _render_dash), on flat cards like the other pages."""
+        row = tk.Frame(parent, bg=MAIN_BG)
+        row.pack(fill="both", expand=True)
         size = DASH_SIZE * DASH_PREVIEW_SCALE
-        card = self._make_flat_card(parent, size + 2 * CARD_PAD + px(40), size + 2 * CARD_PAD + px(40))
-        card.pack(padx=px(20), pady=px(20))
+        title_h = px(44)
+        card = self._make_flat_card(row, size + 2 * CARD_PAD, title_h + size + 2 * CARD_PAD)
+        card.pack(side="right", anchor="n", padx=(px(10), px(20)), pady=px(20))
+        card.create_text(T.SPACE_4 + LABEL_INSET, T.SPACE_4 + px(12), text="Dash", font=T.FONT_TITLE,
+                         fill=T.TEXT_PRIMARY, anchor="w")
         self._dash_image_id = card.create_image(0, 0, anchor="center")
         frame_id = card.create_rectangle(0, 0, 0, 0, outline=MAIN_BORDER)
 
         def layout(event):
-            cx, cy = event.width / 2, CARD_PAD + px(20) + size / 2
+            cx, cy = event.width / 2, title_h + size / 2
             card.coords(self._dash_image_id, cx, cy)
             card.coords(frame_id, cx - size / 2 - 1, cy - size / 2 - 1, cx + size / 2, cy + size / 2)
 
         card.bind("<Configure>", layout, add="+")
         self._dash_card = card
         self._dash_shown_state = None
+        self._build_wheel_buttons_card(row)
         self._dash_preview_poll()
+
+    def _build_wheel_buttons_card(self, parent):
+        """The wheel photo with a marker on each button (numbered, lit while
+        held), where things stand with the calibration, and its buttons."""
+        card = self._make_flat_card(parent, px(380), px(440))
+        card.pack(side="left", fill="both", expand=True, padx=(px(20), px(10)), pady=px(20))
+        card.create_text(T.SPACE_4 + LABEL_INSET, T.SPACE_4 + px(12), text="Wheel buttons", font=T.FONT_TITLE,
+                         fill=T.TEXT_PRIMARY, anchor="w")
+        image_id = card.create_image(0, 0, anchor="center")
+        markers = ui.WheelButtonMarkers(card, WHEEL_BUTTONS, tag="wheel_page_buttons", idle="outline")
+        markers.set_parts(self._btn_parts)
+        self._button_markers.append(markers)
+        status_id = card.create_text(0, 0, text="", font=T.FONT_CAPTION, fill=T.TEXT_SECONDARY, anchor="n",
+                                     justify="center")
+        buttons = tk.Frame(card, bg=MAIN_PANEL)
+        self._buttons_calibrate_btn = ui.FlatButton(buttons, "Calibrate buttons", variant="primary",
+                                                    command=self._open_button_wizard, font=T.FONT_CAPTION)
+        self._buttons_calibrate_btn.pack(side="left")
+        self._buttons_reset_btn = ui.FlatButton(buttons, "Reset to wiring order", command=self._reset_button_map,
+                                                font=T.FONT_CAPTION)
+        self._buttons_reset_btn.pack(side="left", padx=(T.SPACE_2, 0))
+        buttons_id = card.create_window(0, 0, window=buttons, anchor="s")
+        self._buttons_card, self._buttons_status_id = card, status_id
+        header_h, footer_h = px(48), px(92)
+        state = {"size": None, "photo": None}
+
+        def apply_size():
+            w, h = card.winfo_width(), card.winfo_height()
+            side = max(px(80), int(min(w - 2 * CARD_PAD, h - header_h - footer_h)))
+            if side != state["size"]:
+                state["size"] = side
+                state["photo"] = ImageTk.PhotoImage(self._wheel_flat_full.resize((side, side), Image.LANCZOS))
+                card.itemconfig(image_id, image=state["photo"])
+            markers.place(w / 2, header_h + (h - header_h - footer_h) / 2, side, 0.0)
+
+        resize_soon = _rate_limited(card, apply_size, WHEEL_RESIZE_THROTTLE_MS)
+
+        def on_resize(event):
+            w, h = event.width, event.height
+            if w <= 1 or h <= 1:
+                return
+            card.coords(image_id, w / 2, header_h + (h - header_h - footer_h) / 2)
+            card.coords(status_id, w / 2, h - footer_h + px(8))
+            card.itemconfig(status_id, width=max(px(120), w - 2 * T.SPACE_4))
+            card.coords(buttons_id, w / 2, h - T.SPACE_4)
+            resize_soon()
+
+        card.bind("<Configure>", on_resize, add="+")
 
     def _dash_preview_state(self):
         bridge, now = self._dash_bridge, time.monotonic()
@@ -2310,7 +2387,7 @@ class VolgasApp:
                 bool(hub_lost))
 
     def _dash_preview_poll(self):
-        if self._tab_frames["Dash"].winfo_ismapped():
+        if self._tab_frames["Wheel"].winfo_ismapped():
             state = self._dash_preview_state()
             if state != self._dash_shown_state:
                 self._dash_shown_state = state
@@ -3175,6 +3252,7 @@ class VolgasApp:
                     image = image.resize((px(DASH_SIZE), px(DASH_SIZE)), Image.NEAREST)
                 self._home_dash_photo = ImageTk.PhotoImage(image)
                 self._home_dash_image.config(image=self._home_dash_photo)
+        self._refresh_buttons_card()
         self.root.after(self.STATUS_POLL_MS, self._status_poll)
 
     # ---------- updates page (firmware for every device) ----------
@@ -3431,6 +3509,188 @@ class VolgasApp:
                 self._dev_queue.put(("failed", str(e)))
 
         threading.Thread(target=work, daemon=True, name="dash-update").start()
+
+    # ---------- wheel buttons (markers, calibration) ----------
+
+    def _buttons_poll(self):
+        """Light the markers from the hub's latest report, ~100 times a second
+        (the status poll is too slow for pressing a button)."""
+        if self._closing:
+            return
+        bridge = self._dash_bridge
+        snap = bridge.hub_buttons if bridge is not None and bridge.is_hub else None
+        mapped = snap[2] if snap else 0
+        if mapped != self._shown_buttons:
+            self._shown_buttons = mapped
+            for markers in self._button_markers:
+                markers.set_lit(mapped)
+        self.root.after(10, self._buttons_poll)
+
+    def _set_button_parts(self, parts):
+        """Which part of the wheel photo each button is: remember it and move
+        every highlight."""
+        self._btn_parts = list(parts)
+        self._wb_settings["wheel_button_parts"] = self._btn_parts
+        self._wb_settings.pop("wheel_button_positions", None)
+        _save_settings(self._wb_settings)
+        for markers in self._button_markers:
+            markers.set_parts(self._btn_parts)
+
+    def _wheel_buttons_state(self):
+        """(ready, text): whether live buttons and calibration are available,
+        and a line saying where things stand."""
+        bridge = self._dash_bridge
+        if bridge is None or not bridge.is_hub:
+            return False, "The hub isn't connected."
+        if not bridge.hub_status[1]["linked"]:
+            return False, "The wheel isn't linked to the hub."
+        if bridge.hub_buttons is None:
+            return False, ("The hub's firmware doesn't report buttons yet - it needs the new hub firmware, "
+                           "flashed over USB.")
+        if bridge.hub_btn_map is None:
+            return False, "Reading the hub's button map..."
+        return True, vbtn.map_text(bridge.hub_btn_map)
+
+    def _refresh_buttons_card(self):
+        ready, text = self._wheel_buttons_state()
+        self._buttons_card.itemconfig(self._buttons_status_id, text=text,
+                                      fill=T.TEXT_SECONDARY if ready else T.STATUS_WARN)
+        self._buttons_calibrate_btn.set_enabled(ready)
+        self._buttons_reset_btn.set_enabled(ready)
+
+    def _reset_button_map(self):
+        ready, text = self._wheel_buttons_state()
+        if not ready:
+            self._notify(text, "warn")
+            return
+        self._dash_bridge.hub_btn_map = None   # re-read after the hub answers
+        self._dash_bridge.send_to_hub(volgas_wheel_ota.USB_BTN_MAP_SET, bytes(vbtn.identity_map()))
+        self._notify("Wheel buttons are back in wiring order.", "info")
+
+    def _open_button_wizard(self):
+        """Lights up the wheel's buttons on the picture one at a time; you
+        press the one that's lit (so Volgas learns which matrix position it
+        is), or skip it if it isn't wired. At the end the map goes to the hub,
+        which stores it, so the game sees the buttons numbered in the
+        picture's order. A button that's never pressed does nothing
+        afterwards."""
+        ready, text = self._wheel_buttons_state()
+        if not ready:
+            self._notify(text, "warn")
+            return
+        bridge = self._dash_bridge
+        count = max(1, min(bridge.hub_status[1]["buttons"] or WHEEL_BUTTONS, WHEEL_BUTTONS, len(vbtn.PARTS)))
+        cal = vbtn.ButtonCalibration(count)
+        parts = list(vbtn.DEFAULT_PARTS)
+        state = {"saving": None, "result": None}
+
+        win = tk.Toplevel(self.root)
+        win.title("Calibrate wheel buttons")
+        win.configure(bg=MAIN_PANEL)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        body = tk.Frame(win, bg=MAIN_PANEL)
+        body.pack(fill="both", expand=True, padx=T.SPACE_5, pady=T.SPACE_5)
+        text_w = px(420)
+        tk.Label(body, text="Calibrate wheel buttons", font=T.FONT_HEADING, fg=T.TEXT_PRIMARY,
+                 bg=MAIN_PANEL).pack(anchor="w")
+        step_label = tk.Label(body, text="", font=T.FONT_CAPTION, fg=T.TEXT_SECONDARY, bg=MAIN_PANEL)
+        step_label.pack(anchor="w", pady=(T.SPACE_1, T.SPACE_3))
+        instruction = tk.Label(body, text="", font=T.FONT_BODY, fg=T.TEXT_PRIMARY, bg=MAIN_PANEL, wraplength=text_w,
+                               justify="left", height=2, anchor="nw")
+        instruction.pack(anchor="w")
+        picture = px(420)
+        canvas = tk.Canvas(body, width=picture, height=picture, bg=MAIN_PANEL, highlightthickness=0)
+        canvas.pack(anchor="w", pady=(T.SPACE_2, 0))
+        canvas.photo = ImageTk.PhotoImage(self._wheel_flat_full.resize((picture, picture), Image.LANCZOS))
+        canvas.create_image(picture / 2, picture / 2, image=canvas.photo)
+        markers = ui.WheelButtonMarkers(canvas, WHEEL_BUTTONS, tag="wizard_buttons", idle="outline")
+        markers.set_parts(parts)
+        markers.place(picture / 2, picture / 2, picture, 0.0)
+        message = tk.Label(body, text="", font=T.FONT_BODY, fg=T.STATUS_WARN, bg=MAIN_PANEL, wraplength=text_w,
+                           justify="left", height=2, anchor="nw")
+        message.pack(anchor="w", pady=(T.SPACE_2, 0))
+        buttons = tk.Frame(body, bg=MAIN_PANEL)
+        buttons.pack(fill="x", pady=(T.SPACE_3, 0))
+        primary = ui.FlatButton(buttons, "Save", variant="primary", font=T.FONT_LABEL, padx=18, pady=6)
+        primary.pack(side="right")
+        secondary = ui.FlatButton(buttons, "Skip this button", padx=18, pady=6)
+        secondary.pack(side="right", padx=(0, T.SPACE_2))
+        cancel = ui.FlatButton(buttons, "Cancel", command=win.destroy, padx=18, pady=6)
+        cancel.pack(side="left")
+
+        def refresh_markers():
+            assigned = 0
+            for number in cal.assigned.values():
+                assigned |= 1 << number
+            markers.set_assigned(assigned)
+            markers.set_focus(None if cal.done else cal.step)
+            # The one being asked for is lit, the way it shows when pressed.
+            markers.set_lit(0 if cal.done else 1 << cal.step)
+
+        def skip():
+            cal.skip()
+            refresh_markers()
+
+        secondary.set_command(skip)
+
+        def save():
+            state["result"] = cal.result()
+            bridge.hub_btn_map = None   # so the answer to the set (the map now in effect) is what we compare
+            bridge.send_to_hub(volgas_wheel_ota.USB_BTN_MAP_SET, bytes(state["result"]))
+            state["saving"] = time.monotonic() + 3.0
+            primary.set_enabled(False)
+            secondary.set_enabled(False)
+            message.config(text="Saving to the hub...", fg=T.TEXT_SECONDARY)
+
+        primary.set_command(save)
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            now = time.monotonic()
+            if state["saving"] is not None:
+                if bridge.hub_btn_map == state["result"]:
+                    self._set_button_parts(parts)
+                    self._notify("Wheel buttons saved.", "info")
+                    win.destroy()
+                    return
+                if now > state["saving"]:
+                    state["saving"] = None
+                    message.config(text="The hub didn't confirm the new layout, so nothing was changed. Try again.",
+                                   fg=T.STATUS_ERROR)
+                    primary.set_enabled(cal.done)
+                win.after(20, tick)
+                return
+            snap = bridge.hub_buttons if bridge.is_hub else None
+            if snap is None or now - snap[0] > 3.0 or not bridge.hub_status[1]["linked"]:
+                message.config(text="Waiting for the wheel - make sure it's powered and linked to the hub.",
+                               fg=T.STATUS_WARN)
+                primary.set_enabled(False)
+                win.after(20, tick)
+                return
+            if cal.feed(snap[1], now):
+                refresh_markers()
+            if cal.done:
+                step_label.config(text="All buttons done")
+                instruction.config(text="Save this layout?")
+                secondary.set_enabled(False)
+                primary.set_enabled(True)
+            else:
+                paddle = vbtn.PARTS[parts[cal.step]][0] == "poly"
+                step_label.config(text=f"Button {cal.step + 1} of {count}")
+                instruction.config(text=("Pull the highlighted paddle, then let go." if paddle else
+                                         "Press the highlighted button, then let go."))
+                secondary.set_enabled(True)
+                primary.set_enabled(False)
+            message.config(text=cal.message, fg=T.STATUS_WARN)
+            win.after(20, tick)
+
+        win.bind("<Escape>", lambda _e: win.destroy())
+        refresh_markers()
+        tick()
+        cancel.focus_set()
 
     # ---------- shutdown ----------
 

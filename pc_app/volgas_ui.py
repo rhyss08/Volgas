@@ -7,6 +7,7 @@ import math
 import tkinter as tk
 from tkinter import font as tkfont
 
+import volgas_buttons as vb
 import volgas_theme as T
 
 
@@ -111,6 +112,112 @@ class FlatButton(tk.Label):
 
     def invoke(self):
         self._invoke()
+
+
+# ---------- wheel button markers ----------
+
+class WheelButtonMarkers:
+    """Highlights for the wheel's buttons, drawn over the wheel photo on a
+    canvas (create the photo first so they sit on top). Button n sits on one
+    part of the wheel (volgas_buttons.PARTS: a round button's cap, or a
+    paddle's outline); set_parts() says which. place() says where the square
+    wheel image is (centre, side, and how far the wheel is turned clockwise)
+    and the highlights follow it. set_lit() lights the buttons held down - a
+    round button's cap fills, a paddle's outline brightens; set_assigned()
+    marks buttons already calibrated (green outline) and set_focus() rings the
+    one being asked for. idle="outline" also draws a faint outline of every
+    part, numbers="always" numbers them (for calibrating); the defaults show
+    nothing until a button is held."""
+
+    def __init__(self, canvas, count, tag="wheel_buttons", numbers="never", idle="none"):
+        self.canvas, self.count, self.numbers, self.idle = canvas, count, numbers, idle
+        self.parts = [None] * count
+        self._lit = self._assigned = 0
+        self._focus = None
+        self._geom = None
+        hidden = {"state": "hidden", "tags": tag}
+        self._ovals = [canvas.create_oval(0, 0, 0, 0, **hidden) for _ in range(count)]
+        self._polys = [canvas.create_polygon(0, 0, 0, 0, 0, 0, fill="", joinstyle="round", **hidden)
+                       for _ in range(count)]
+        font = ("Segoe UI", 8, "bold")
+        self._shadows = [canvas.create_text(0, 0, text=str(i + 1), font=font, fill="#000000", **hidden)
+                         for i in range(count)]
+        self._labels = [canvas.create_text(0, 0, text=str(i + 1), font=font, fill="#ffffff", **hidden)
+                        for i in range(count)]
+
+    def set_parts(self, parts):
+        self.parts = (list(parts) + [None] * self.count)[:self.count]
+        self.layout()
+
+    def place(self, cx, cy, size, angle_deg=0.0):
+        self._geom = (cx, cy, size, angle_deg)
+        self.layout()
+
+    def layout(self):
+        if self._geom is None:
+            return
+        cx, cy, size, angle = self._geom
+        turn = vb.rotator(angle)
+        for i in range(self.count):
+            part = self.parts[i]
+            if part is None or size <= 0:
+                for items in (self._ovals, self._polys, self._shadows, self._labels):
+                    self.canvas.itemconfig(items[i], state="hidden")
+                continue
+            shape = vb.PARTS[part]
+            if shape[0] == "circle":
+                dx, dy = turn(shape[1], shape[2])
+                x, y, r = cx + dx * size, cy + dy * size, shape[3] * size
+                self.canvas.coords(self._ovals[i], x - r, y - r, x + r, y + r)
+            else:
+                flat = []
+                for fx, fy in shape[1]:
+                    dx, dy = turn(fx, fy)
+                    flat += [cx + dx * size, cy + dy * size]
+                self.canvas.coords(self._polys[i], *flat)
+                mx, my = vb.part_centre(part)
+                dx, dy = turn(mx, my)
+                x, y = cx + dx * size, cy + dy * size
+            self.canvas.coords(self._shadows[i], x + 1, y + 1)
+            self.canvas.coords(self._labels[i], x, y)
+            self._paint(i, shape[0] == "circle")
+
+    def _paint(self, i, circle):
+        shown, other = (self._ovals[i], self._polys[i]) if circle else (self._polys[i], self._ovals[i])
+        self.canvas.itemconfig(other, state="hidden")
+        lit = self._lit >> i & 1
+        if lit:
+            style = {"fill": T.ACCENT, "outline": ""} if circle else {"fill": "", "outline": T.ACCENT, "width": 4}
+        elif self._focus == i:
+            style = {"fill": "", "outline": T.ACCENT, "width": 3}
+        elif self._assigned >> i & 1:
+            style = {"fill": "", "outline": T.STATUS_OK, "width": 3}
+        elif self.idle == "outline":
+            style = {"fill": "", "outline": "#9aa3b2", "width": 1}
+        else:
+            style = None
+        if style is None:
+            self.canvas.itemconfig(shown, state="hidden")
+        else:
+            self.canvas.itemconfig(shown, state="normal", **style)
+        number = "normal" if self.numbers == "always" else "hidden"
+        self.canvas.itemconfig(self._shadows[i], state=number)
+        self.canvas.itemconfig(self._labels[i], state=number)
+
+    def set_lit(self, mask):
+        if mask != self._lit:
+            self._lit = mask
+            self.layout()
+
+    def set_assigned(self, mask):
+        if mask != self._assigned:
+            self._assigned = mask
+            self.layout()
+
+    def set_focus(self, index):
+        if index != self._focus:
+            self._focus = index
+            self.layout()
 
 
 # ---------- status pill ----------

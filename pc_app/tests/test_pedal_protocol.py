@@ -75,3 +75,21 @@ def test_formats_match_firmware_header():
     assert struct_format_from_header("CalibrationData").replace("<", "") == CAL_FMT.replace("<", "")
     assert struct_format_from_header("StatusPacket").replace("<", "") == STATUS_FMT.replace("<", "")
     assert STATUS_SIZE == 12 and CAL_SIZE == 22
+
+
+def test_black_pill_header_is_identical_to_the_blue_pill_one():
+    paths = [os.path.join(REPO_DIR, d, "pedal_protocol.h") for d in ("pedal_set", "pedal_set_f4")]
+    with open(paths[0], "rb") as a, open(paths[1], "rb") as b:
+        assert a.read() == b.read()
+
+
+def test_both_pedal_usb_ids_are_found(monkeypatch):
+    from types import SimpleNamespace
+    import volgas_pedal_protocol as p
+    ports = [SimpleNamespace(device="COM3", vid=0x1EAF, pid=0x0004)]
+    monkeypatch.setattr(p.serial.tools.list_ports, "comports", lambda: ports)
+    assert p.find_pedal_port() == "COM3"
+    ports[0].pid = 0x0003
+    assert p.find_pedal_port() == "COM3"
+    ports[0].pid = 0x0005
+    assert p.find_pedal_port() is None

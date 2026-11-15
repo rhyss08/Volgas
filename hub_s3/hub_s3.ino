@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Preferences.h>
 #include "USB.h"
 #include "USBCDC.h"
 #include "USBHIDGamepad.h"
@@ -17,6 +18,11 @@
 //   - The wheel's buttons arrive over ESP-NOW and go to the PC as this
 //     board's USB game controller. If the wheel goes quiet, every button is
 //     released.
+//   - Button map: the wheel reports a raw bit per matrix position; the hub
+//     turns them into the button numbers the PC sees through a 32-entry map
+//     (raw bit -> button number, 0xFF = unused) kept in flash. Volgas's
+//     "calibrate wheel buttons" sets it. Raw and mapped state are reported to
+//     Volgas on every change.
 //   - Wireless wheel updates: the PC sends update commands over the same USB
 //     serial (types 0x40+ below, same framing as the dash frames); the hub
 //     turns each into one LINK_OTA_* packet and passes the wheel's answer
@@ -55,17 +61,49 @@ QueueHandle_t rxQueue;
 #define USB_OTA_END   0x42   // PC -> hub
 #define USB_OTA_ABORT 0x43   // PC -> hub
 #define USB_WHEEL_INFO 0x44  // PC -> hub: asks for USB_WHEEL_STATUS
+#define USB_BTN_MAP_GET 0x45 // PC -> hub: asks for USB_BTN_MAP
+#define USB_BTN_MAP_SET 0x46 // PC -> hub: uint8 map[32]; stored, then answered with USB_BTN_MAP
 #define USB_OTA_ACK   0x50   // hub -> PC: uint8 status, uint32 next (the wheel's LINK_OTA_ACK)
-#define USB_WHEEL_STATUS 0x51  // hub -> PC: uint8 linked, uint8 model, uint16 fw, uint8 buttons, int8 rssi
+#define USB_WHEEL_STATUS 0x51  // hub -> PC: uint8 linked, uint8 model, uint16 fw, uint8 buttons, int8 rssi, uint32 raw, uint32 mapped
+#define USB_BTN_MAP   0x52   // hub -> PC: uint8 map[32] (the map in effect)
+#define USB_BUTTONS   0x53   // hub -> PC: uint32 raw, uint32 mapped; sent on every change
 
 uint8_t wheelMac[6];
 bool wheelKnown = false;
 LinkHello lastHello = {};
 bool helloSeen = false;
 unsigned long lastWheelMs = 0;
-uint32_t wheelButtons = 0;
+uint32_t rawButtons = 0;     // as the wheel reports them, bit = matrix position
+uint32_t wheelButtons = 0;   // after the button map: what the PC's game controller shows
 int8_t lastRssi = 0;
 uint32_t packetsIn = 0, packetsOut = 0, sendErrors = 0;
+
+// ---------- button map ----------
+Preferences prefs;
+uint8_t btnMap[32];   // raw bit -> button number (0-31), 0xFF = unused
+
+bool validMap(const uint8_t* m) {
+  for (uint8_t i = 0; i < 32; i++) {
+    if (m[i] != 0xFF && m[i] >= 32) return false;
+  }
+  return true;
+}
+
+void loadButtonMap() {
+  for (uint8_t i = 0; i < 32; i++) btnMap[i] = i;   // wiring order until calibrated
+  uint8_t saved[32];
+  if (prefs.getBytes("btnmap", saved, sizeof(saved)) == sizeof(saved) && validMap(saved)) {
+    memcpy(btnMap, saved, sizeof(saved));
+  }
+}
+
+uint32_t mapButtons(uint32_t raw) {
+  uint32_t out = 0;
+  for (uint8_t i = 0; i < 32; i++) {
+    if ((raw >> i & 1) && btnMap[i] < 32) out |= 1UL << btnMap[i];
+  }
+  return out;
+}
 
 // Runs in the Wi-Fi task: only copy the packet out; loop() does the work.
 void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
@@ -131,7 +169,7 @@ void handlePacket(const RxPacket& p) {
     sendToWheel(&ack, sizeof(ack));
   } else if (h->type == LINK_BUTTONS && p.len >= sizeof(LinkButtons)) {
     learnWheel(p.mac);
-    wheelButtons = ((const LinkButtons*)p.data)->buttons;
+    rawButtons = ((const LinkButtons*)p.data)->buttons;
   } else if (h->type == LINK_OTA_ACK && p.len >= sizeof(LinkOtaAck)) {
     learnWheel(p.mac);
     const LinkOtaAck* a = (const LinkOtaAck*)p.data;
@@ -186,11 +224,21 @@ void handleUsbFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
     sendToWheel(&h, sizeof(h));
   } else if (type == USB_WHEEL_INFO) {
     bool linked = wheelKnown && millis() - lastWheelMs < LINK_WHEEL_TIMEOUT_MS;
-    uint8_t s[6] = {(uint8_t)linked, helloSeen ? lastHello.modelId : (uint8_t)0, 0, 0,
-                    helloSeen ? lastHello.buttonCount : (uint8_t)0, (uint8_t)lastRssi};
+    uint8_t s[14] = {(uint8_t)linked, helloSeen ? lastHello.modelId : (uint8_t)0, 0, 0,
+                     helloSeen ? lastHello.buttonCount : (uint8_t)0, (uint8_t)lastRssi};
     uint16_t fw = helloSeen ? lastHello.fwVersion : 0;
     memcpy(s + 2, &fw, 2);
+    memcpy(s + 6, &rawButtons, 4);
+    memcpy(s + 10, &wheelButtons, 4);
     usbSendFrame(USB_WHEEL_STATUS, s, sizeof(s));
+  } else if (type == USB_BTN_MAP_GET) {
+    usbSendFrame(USB_BTN_MAP, btnMap, sizeof(btnMap));
+  } else if (type == USB_BTN_MAP_SET) {
+    if (len == sizeof(btnMap) && validMap(payload)) {
+      memcpy(btnMap, payload, sizeof(btnMap));
+      prefs.putBytes("btnmap", btnMap, sizeof(btnMap));
+    }
+    usbSendFrame(USB_BTN_MAP, btnMap, sizeof(btnMap));   // the map in effect, so the PC can see if it took
   }
 }
 
@@ -233,6 +281,8 @@ void setup() {
   esp_wifi_set_channel(LINK_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) Serial.println("ESP-NOW failed to start");
   esp_now_register_recv_cb(onReceive);
+  prefs.begin("volgas", false);
+  loadButtonMap();
   Serial.printf("hub %s on channel %d\n", WiFi.macAddress().c_str(), LINK_CHANNEL);
 
   USB.manufacturerName("Sim Rig");
@@ -250,12 +300,28 @@ void loop() {
   while (xQueueReceive(rxQueue, &p, 0) == pdTRUE) handlePacket(p);
 
   bool wheelLinked = wheelKnown && now - lastWheelMs < LINK_WHEEL_TIMEOUT_MS;
-  if (!wheelLinked) wheelButtons = 0;   // never leave a button held on a lost link
+  if (!wheelLinked) rawButtons = 0;   // never leave a button held on a lost link
+  wheelButtons = mapButtons(rawButtons);
 
   static uint32_t sentButtons = 0xFFFFFFFF;
   if (wheelButtons != sentButtons) {
     Gamepad.send(0, 0, 0, 0, 0, 0, HAT_CENTER, wheelButtons);
     sentButtons = wheelButtons;
+  }
+
+  // Tell Volgas about every change (it also gets the state in each wheel
+  // status). Only while it has the port open: writing to a closed CDC port
+  // blocks for its 250 ms timeout.
+  static uint32_t pushedRaw = 0xFFFFFFFF, pushedMapped = 0xFFFFFFFF;
+  if (rawButtons != pushedRaw || wheelButtons != pushedMapped) {
+    pushedRaw = rawButtons;
+    pushedMapped = wheelButtons;
+    if (USBSerial) {
+      uint8_t b[8];
+      memcpy(b, &rawButtons, 4);
+      memcpy(b + 4, &wheelButtons, 4);
+      usbSendFrame(USB_BUTTONS, b, sizeof(b));
+    }
   }
 
   // Volgas -> hub: dash frames go on to the wheel, update commands are relayed.

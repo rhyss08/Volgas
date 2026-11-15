@@ -28,6 +28,10 @@ ESP32_VID, ESP32_PID = 0x303A, 0x1001
 SYNC0, SYNC1 = 0xAA, 0x55
 USB_OTA_BEGIN, USB_OTA_DATA, USB_OTA_END, USB_OTA_ABORT = 0x40, 0x41, 0x42, 0x43
 USB_WHEEL_INFO, USB_OTA_ACK, USB_WHEEL_STATUS = 0x44, 0x50, 0x51
+# Wheel buttons (hub_s3.ino): the hub reports the wheel's raw matrix state and
+# the state after its button map, and stores a map set from Volgas.
+USB_BTN_MAP_GET, USB_BTN_MAP_SET = 0x45, 0x46    # PC -> hub
+USB_BTN_MAP, USB_BUTTONS = 0x52, 0x53            # hub -> PC
 CHUNK = 200
 
 OTA_OK, OTA_DRIVING, OTA_BEGIN_FAILED, OTA_WRITE_FAILED, OTA_VERIFY_FAILED, OTA_NOT_STARTED, OTA_DONE = range(7)

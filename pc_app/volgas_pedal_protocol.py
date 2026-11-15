@@ -14,8 +14,10 @@ import serial.tools.list_ports
 # USBComposite defaults to LeafLabs' VID; PID is the one pedal_set.ino
 # sets explicitly (bumped to 0x0003 when CDC serial was added). Used to
 # find the Pedal Set's COM port automatically instead of picking by name.
+# The Black Pill pedals (pedal_set_f4, 2026-11-13) use 0x0004 with the same VID.
 PEDAL_VID = 0x1EAF
 PEDAL_PID = 0x0003
+PEDAL_PIDS = (0x0003, 0x0004)
 
 SYNC0, SYNC1 = 0xAA, 0x55
 MAX_PAYLOAD = 32  # matches the firmware parser's limit
@@ -37,7 +39,7 @@ AXIS_MAX = 1023              # the joystick axes are 10-bit
 def find_pedal_port():
     """Return the COM port of the Pedal Set by USB VID/PID, or None."""
     for p in serial.tools.list_ports.comports():
-        if p.vid == PEDAL_VID and p.pid == PEDAL_PID:
+        if p.vid == PEDAL_VID and p.pid in PEDAL_PIDS:
             return p.device
     return None
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Wheel buttons
+- The Dash page is now the **Wheel** page. It shows the wheel with its buttons highlighted while they're held (a round button's coloured cap lights up, a shifter paddle's outline lights up), beside the live picture of the dash's screen. On the Wheel page every button and paddle also has a faint outline.
+- The same highlights sit on the wheel photo on Home and turn with the steering.
+- **Calibrate buttons** (on the Wheel page): each button and paddle lights up on the wheel picture in turn; press the one that's lit so the hub learns which one it is. Skip leaves a button unused. Volgas saves the layout to the hub, which keeps it, and remembers the positions. **Reset to wiring order** undoes the layout. Buttons that were never pressed in the wizard do nothing afterwards.
+- Wheel buttons show up almost at once: Volgas asks the hub for them every 10 ms (it was once a second, because the hub's own change reports never got through), services the hub every 2 ms instead of every 50 ms, and refreshes the highlights every 10 ms.
+- Needs new hub firmware (it reports the buttons and stores the layout), flashed over USB: updating the hub from Volgas comes later. With the old hub firmware the section says so and calibration stays off.
+
 ## 0.3.2 (2026-11-13)
 
 ### Dash
