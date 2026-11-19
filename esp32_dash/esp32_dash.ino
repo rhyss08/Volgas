@@ -72,7 +72,8 @@ const uint8_t COL_PINS[] = {13, 2, 3};
 #define ROW_COUNT (sizeof(ROW_PINS) / sizeof(ROW_PINS[0]))
 #define COL_COUNT (sizeof(COL_PINS) / sizeof(COL_PINS[0]))
 #define BUTTON_COUNT (ROW_COUNT * COL_COUNT)
-#define BUTTON_DEBOUNCE_READS 3   // a change counts once it reads the same this many loops in a row (~6 ms)
+#define BUTTON_DEBOUNCE_READS 6   // a change counts once it reads the same this many loops in a row (~20 ms):
+                                  // the matrix has no diodes and only the chip's weak pull-ups, so it picks up noise
 
 // ST7735 display wiring (own bus, HSPI/default global SPI):
 //   VCC -> 3.3V, GND -> GND, LED (backlight) -> GPIO7
@@ -768,7 +769,7 @@ const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // GPIO7, hub status only when lost, clock centred); from 5.1 on it's
 // major << 8 | minor (volgas_devices.format_wheel_version), so 0x0501 is 5.1
 // and still compares higher than the old plain 5.
-const uint16_t WHEEL_FW_VERSION = 0x0501;   // 5.1: the date next to the day on the standby clock
+const uint16_t WHEEL_FW_VERSION = 0x0503;   // 5.3: ghost presses filtered (5.2: steadier scan, 5.1: the date)
 
 struct RxPacket {
   uint8_t mac[6];
@@ -1003,19 +1004,41 @@ uint32_t matrixScan() {
   for (uint8_t r = 0; r < ROW_COUNT; r++) {
     pinMode(ROW_PINS[r], OUTPUT);
     digitalWrite(ROW_PINS[r], LOW);
-    delayMicroseconds(10);   // let the column lines settle through the pull-ups
+    delayMicroseconds(30);   // let the column lines settle through the pull-ups
     for (uint8_t c = 0; c < COL_COUNT; c++) {
       if (digitalRead(COL_PINS[c]) == LOW) pressed |= 1UL << (r * COL_COUNT + c);
     }
+    // Drive the row high for a moment before letting it float, so a held button on it can't keep its column low
+    // into the next row's read. No other row is driven now, so this can't short through two pressed buttons.
+    digitalWrite(ROW_PINS[r], HIGH);
+    delayMicroseconds(5);
     pinMode(ROW_PINS[r], INPUT);
   }
   return pressed;
 }
 
+// The matrix has no diodes: holding three corners of a rectangle (two rows x
+// two columns) makes the fourth read as pressed too, and a real fourth press
+// looks exactly the same. So when all four corners read pressed, none of them
+// may newly count as pressed - only the ones already held stay held. A real
+// third/fourth press in that rectangle registers once another is let go.
+uint32_t filterGhosts(uint32_t pins, uint32_t held) {
+  uint32_t ambiguous = 0;
+  for (uint8_t r1 = 0; r1 < ROW_COUNT; r1++)
+    for (uint8_t r2 = r1 + 1; r2 < ROW_COUNT; r2++)
+      for (uint8_t c1 = 0; c1 < COL_COUNT; c1++)
+        for (uint8_t c2 = c1 + 1; c2 < COL_COUNT; c2++) {
+          uint32_t rect = (1UL << (r1 * COL_COUNT + c1)) | (1UL << (r1 * COL_COUNT + c2)) |
+                          (1UL << (r2 * COL_COUNT + c1)) | (1UL << (r2 * COL_COUNT + c2));
+          if ((pins & rect) == rect) ambiguous |= rect;
+        }
+  return pins & ~(ambiguous & ~held);
+}
+
 void readButtons() {
   static uint32_t candidate = 0;
   static uint8_t stableReads = 0;
-  uint32_t pins = matrixScan();
+  uint32_t pins = filterGhosts(matrixScan(), wheelButtons);
   if (pins == candidate) {
     if (stableReads < BUTTON_DEBOUNCE_READS) stableReads++;
   } else {

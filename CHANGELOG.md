@@ -1,5 +1,10 @@
 # Changelog
 
+## Dash firmware 5.3 (2026-11-19, added to the 0.3.3 release)
+- Steadier button reading: no more random presses or flicker (each change must hold for about 20 ms, and the matrix scan settles properly between rows).
+- No more ghost presses on a matrix without diodes: when three buttons in an L are held, the fourth corner no longer shows up. The third press of such an L waits until one of the others is let go; any one or two buttons work as before.
+- Install it from Settings -> Device updates.
+
 ## 0.3.3 (2026-11-15)
 
 ### Wheel buttons
