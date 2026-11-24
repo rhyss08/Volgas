@@ -118,3 +118,33 @@ def test_rotation_follows_the_photo():
     dx, dy = b.rotator(180)(0.5, 0.0)
     assert abs(dx) < 1e-9 and abs(dy - 0.5) < 1e-9
     assert b.rotator(0)(0.3, 0.8) == (0.3 - 0.5, 0.8 - 0.5)
+
+
+def test_background_keying_keeps_the_logo_and_the_white_button():
+    # The keying once deleted the white button's cap and part of the logo (large light-grey patches), because it
+    # removed any big enough light patch; it must keep both and still clear the windows beside the grips.
+    import os
+    from PIL import Image
+    import volgas
+    photo = Image.open(os.path.join(os.path.dirname(os.path.abspath(volgas.__file__)), "assets", "volgas_wheel.png")).convert("RGBA")
+    side = max(b.PHOTO_W, b.PHOTO_H)
+    square = Image.new("RGBA", (side, side), (26, 30, 38, 255))
+    square.paste(photo, ((side - b.PHOTO_W) // 2, (side - b.PHOTO_H) // 2))
+    keyed = volgas._key_out_checkerboard_background(square.resize((640, 640), Image.LANCZOS), fill=(26, 30, 38))
+    alpha = keyed.getchannel("A")
+    scale = 640 / side
+
+    def kept(x, y, r):                      # share of a photo-pixel circle that stays opaque
+        cx, cy = b.square_point(x, y)
+        n = hit = 0
+        for dy in range(-r, r + 1, 2):
+            for dx in range(-r, r + 1, 2):
+                if dx * dx + dy * dy <= r * r:
+                    n += 1
+                    hit += alpha.getpixel((round((cx * side + dx) * scale), round((cy * side + dy) * scale))) > 128
+        return hit / n
+    assert kept(828, 636, 20) > 0.95        # the white button's cap
+    assert kept(640, 440, 25) > 0.95        # the left stroke of the V in the logo
+    for box in ((103, 303, 163, 391), (479, 300, 545, 390)):   # the windows between each grip and the body
+        cleared = sum(1 for y in range(box[1], box[3]) for x in range(box[0], box[2]) if alpha.getpixel((x, y)) < 128)
+        assert cleared > 1500

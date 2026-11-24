@@ -31,18 +31,23 @@ _CAP_CENTRES = ((372.5, 330.5), (503, 329), (857, 323), (994.5, 326),   # orange
                 (432, 499.5), (926, 503),                               # red, green
                 (527, 631), (828.5, 636))                               # black, white at the bottom (measured)
 _CAP_RADIUS = 25
-# The left shifter paddle's outline in photo pixels. The right one is the same shape mirrored, placed where
-# it matched the photo best (right x = _RIGHT_PADDLE_X - left x, 6 px higher).
+# The left shifter paddle's outline in photo pixels, and the right one's: traced separately, because the two plates
+# aren't mirror images in the photo (the right one has a notch at the bottom left and a different top edge).
 _LEFT_PADDLE = ((279, 356), (305, 358), (313, 372), (328, 386), (345, 398), (360, 403), (366, 415), (365, 430),
                 (358, 460), (350, 483), (348, 498), (300, 498), (283, 490), (273, 475), (269, 450), (269, 415),
                 (272, 390), (277, 365))
 
-_RIGHT_PADDLE_X, _RIGHT_PADDLE_DY = 1396, -6
+_RIGHT_PADDLE = ((1066, 356), (1082, 353), (1098, 348), (1114, 343.5), (1118, 343.5), (1120, 368),
+                 (1124, 396), (1127, 420), (1127, 456), (1126, 466), (1123, 474), (1118, 480),
+                 (1111, 486), (1100, 491), (1088, 493), (1040, 493), (1034, 492), (1031, 482),
+                 (1019, 479), (1017, 476), (1012, 460), (1006, 440), (1002, 426), (1000, 418),
+                 (1002, 409), (1012, 402), (1023, 399), (1030, 395), (1036, 389), (1050, 375),
+                 (1065, 359))
 
 # The 12 parts of the wheel that can be a button: ("circle", x, y, radius) or ("poly", [(x, y), ...]).
 PARTS = ([("circle", *square_point(x, y), _CAP_RADIUS / _SIDE) for x, y in _CAP_CENTRES]
          + [("poly", [square_point(x, y) for x, y in _LEFT_PADDLE]),
-            ("poly", [square_point(_RIGHT_PADDLE_X - x, y + _RIGHT_PADDLE_DY) for x, y in _LEFT_PADDLE])])
+            ("poly", [square_point(x, y) for x, y in _RIGHT_PADDLE])])
 
 # Which part each button number is: button n is part n-1 (the calibration asks for the buttons in this order).
 DEFAULT_PARTS = list(range(len(PARTS)))

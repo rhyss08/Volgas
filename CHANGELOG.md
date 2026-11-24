@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Pedals (new firmware 1.0 for the Black Pill)
+- **Volgas can update the pedals' firmware** (Settings -> Device updates -> Pedals). It saves the calibration, restarts the pedals into their USB bootloader by itself (no button), writes and checks the new firmware, then puts the calibration back and confirms it. It needs ST's free STM32CubeProgrammer installed. If an update is interrupted, the pedals stay in the bootloader and running the update again finishes it.
+- **Adaptive filter:** both pedals are smoothed heavily while still and hardly at all while moving, so they are steady at rest and quick on a stab.
+- **Brake read at 80 samples a second** (the HX711 module's RATE pad tied high; it still works at 10).
+- **Safety:** a hardware watchdog restarts a frozen program; the throttle drops to 0 if its sensor reads at the very top or bottom of its range; the brake drops to 0 if the HX711 stops answering or keeps answering with its maximum (open or crossed wires). The fault is announced in Volgas and shown on the Pedals page.
+- **The pedals report their firmware version**, which the Pedals card in Device updates now shows. Older firmware shows as "older firmware" and is offered the update.
+
+### Interface
+- Wheelbase page: Set Centre is above the steering angle, and the Power Limit warning and the "Changed, not saved" message are gone.
+- Pedals page: the "Calibration read from the pedals" message is gone.
+- The wheel photo is drawn whole again: the white button and the V of the logo were being cut out by the background removal.
+- Device updates: the dash card's "From file..." button is gone.
+
 ## Dash firmware 5.3 (2026-11-19, added to the 0.3.3 release)
 - Steadier button reading: no more random presses or flicker (each change must hold for about 20 ms, and the matrix scan settles properly between rows).
 - No more ghost presses on a matrix without diodes: when three buttons in an L are held, the fourth corner no longer shows up. The third press of such an L waits until one of the others is let go; any one or two buttons work as before.

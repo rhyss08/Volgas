@@ -1,5 +1,6 @@
 #include <Adafruit_TinyUSB.h>
 #include <HX711.h>
+#include <IWatchdog.h>
 #include "stm32f4xx_hal.h"
 #include "pedal_protocol.h"
 
@@ -23,6 +24,17 @@
 // into the bootloader (RESTART INTO THE ROM BOOTLOADER below), or hold BOOT0
 // and tap NRST. Erase all first or the verify fails.
 //
+// Firmware 1.0 (2026-11-24) adds, on top of that port:
+//   - an adaptive ("1 euro") filter for both pedals: heavy smoothing while a
+//     pedal is still, almost none while it moves fast, instead of one fixed
+//     smoothing that is a compromise between the two;
+//   - the brake read at the HX711's 80 samples a second (the module's RATE pad
+//     is tied high; at 10 SPS the same code just sees fewer samples);
+//   - fault detection (throttle sensor at the ADC's rails, HX711 silent or
+//     stuck at its maximum) that holds the affected axis at 0 and reports it;
+//   - a hardware watchdog that restarts a frozen program;
+//   - a firmware version (MSG_INFO) so Volgas can show it and update it.
+//
 // Planned: this board is wired to the ESP32-S3 hub over USART2 (PA2/PA3) and
 // updated through it - not written yet.
 
@@ -38,6 +50,10 @@
 // needs to be attached.
 #define DEBUG_SERIAL Serial1
 
+// Firmware version: major << 8 | minor, like the wheel's (0x0100 = 1.0). Bump it
+// on every release - Volgas compares it with the published firmware.
+#define PEDAL_FW_VERSION 0x0100
+
 #define USB_VID 0x1EAF
 #define USB_PID 0x0004   // the Blue Pill pedals were 0x0003; a new id so Windows never mixes their descriptors
 
@@ -47,9 +63,26 @@
 // Compiled-in defaults, used when flash holds no valid saved calibration.
 CalibrationData cal = { 2180, 3000, -2000, -350000L, {0, 44, 66, 84, 100}, {0, 25, 50, 75, 100} };
 
-const float HALL_SMOOTHING = 0.45;         // EMA, per loop iteration (see pedal_set.ino for the history)
 const uint8_t HALL_OVERSAMPLE    = 8;      // ADC reads averaged per loop iteration
 const uint8_t HALL_MEDIAN_WINDOW = 3;      // rejects a single-sample spike
+
+// Adaptive filter (Casiez et al.'s "1 euro" filter): a low-pass filter whose
+// cutoff rises with how fast the pedal is moving. minCutoff is the smoothing
+// at rest (Hz, lower = steadier), beta how quickly the cutoff opens up with
+// speed (Hz per "full travels per second"), dCutoff smooths the speed estimate.
+// Speed is measured in fractions of the calibrated travel, so one setting suits
+// both pedals whatever their raw range. A full stab (a travel in ~0.2 s = 5
+// travels/s) opens the filter to about minCutoff + 5 * beta.
+const float HALL_MIN_CUTOFF  = 1.5f, HALL_BETA  = 8.0f, HALL_D_CUTOFF  = 8.0f;
+const float LOAD_MIN_CUTOFF  = 1.0f, LOAD_BETA  = 6.0f, LOAD_D_CUTOFF  = 8.0f;
+
+// Faults (see pedal_protocol.h): what counts as one and how long it must last.
+const int  HALL_RAIL_LOW  = 150;           // 12-bit counts; a working sensor never goes near 0 or 4095
+const int  HALL_RAIL_HIGH = 3950;
+const unsigned long HALL_FAULT_MS = 50;
+const unsigned long LOAD_SILENT_MS = 500;  // no HX711 sample for this long = fault
+const unsigned long LOAD_SATURATED_MS = 500;
+const unsigned long WATCHDOG_US = 2000000; // restart if the main loop stalls for 2 s (a flash save takes up to ~1 s)
 
 const unsigned long STATUS_INTERVAL_MS = 20;   // 50 Hz, only while the PC has the port open
 
@@ -65,9 +98,40 @@ uint8_t const hidReportDescriptor[] = {
 Adafruit_USBD_HID usbHid;
 HX711 scale;
 
+struct AdaptiveFilter {
+  float minCutoff, beta, dCutoff;
+  float x = 0, dx = 0;
+  bool primed = false;
+
+  static float alpha(float cutoff, float dt) {
+    float tau = 1.0f / (6.2831853f * cutoff);
+    return dt / (dt + tau);
+  }
+  void reset(float v) { x = v; dx = 0; primed = true; }
+  // v: new sample, dt: seconds since the last one, span: the pedal's calibrated travel in the same units.
+  float update(float v, float dt, float span) {
+    if (!primed || dt <= 0) { reset(v); return x; }
+    if (dt > 0.1f) dt = 0.1f;
+    dx += alpha(dCutoff, dt) * ((v - x) / dt - dx);
+    float cutoff = minCutoff + beta * fabsf(dx) / span;
+    x += alpha(cutoff, dt) * (v - x);
+    return x;
+  }
+};
+
+AdaptiveFilter hallFilter = {HALL_MIN_CUTOFF, HALL_BETA, HALL_D_CUTOFF};
+AdaptiveFilter loadFilter = {LOAD_MIN_CUTOFF, LOAD_BETA, LOAD_D_CUTOFF};
+
 float hallFiltered = 0;
-long loadRaw = 0;   // persists between HX711 samples (~10 Hz) so the brake holds its value
+long loadRaw = 0;   // the filtered brake reading, relative to the start-up tare; holds between HX711 samples
 unsigned long lastStatusSent = 0;
+unsigned long lastInfoSent = 0;
+unsigned long lastLoadSampleMs = 0;   // when the HX711 last delivered a sample
+unsigned long lastLoadSampleUs = 0;
+unsigned long loadSaturatedSince = 0; // 0 = the HX711's last sample wasn't at its limit
+unsigned long hallBadSince = 0;       // 0 = the hall sensor reads inside the ADC's range
+uint8_t activeFaults = 0;             // PEDAL_FAULT_* bits that hold an axis at 0 right now
+bool watchdogReset = false;           // the last restart came from the watchdog
 
 // ==========================================
 //   FLASH PERSISTENCE
@@ -138,6 +202,7 @@ bool saveCalibration() {
   memcpy(rec.data, &cal, sizeof(cal));
   rec.crc = crc32((const uint8_t*)&rec, sizeof(rec) - 4);
 
+  IWatchdog.reload();   // an erase can take most of a second
   HAL_FLASH_Unlock();
   __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR | FLASH_FLAG_PGAERR |
                          FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
@@ -153,6 +218,7 @@ bool saveCalibration() {
     ok = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i * 4, words[i]) == HAL_OK;
   }
   HAL_FLASH_Lock();
+  IWatchdog.reload();
 
   ok = ok && recordValid((const CalRecord*)addr);
   if (ok) {
@@ -190,8 +256,21 @@ void sendFrame(uint8_t type, const void* payload, uint8_t len) {
   SerialTinyUSB.write(frame, 5 + len);
 }
 
+void sendInfo() {
+  PedalInfo info;
+  info.fwVersion = PEDAL_FW_VERSION;
+  info.faults = activeFaults | (watchdogReset ? PEDAL_FAULT_WATCHDOG_RESET : 0);
+  info.boardId = PEDAL_BOARD_BLACKPILL_F411;
+  info.protocol = PEDAL_PROTOCOL_VERSION;
+  sendFrame(MSG_INFO, &info, sizeof(info));
+  lastInfoSent = millis();
+}
+
 void handleFrame(uint8_t type, const uint8_t* payload, uint8_t len) {
   switch (type) {
+    case MSG_GET_INFO:
+      sendInfo();
+      break;
     case MSG_SET_CALIBRATION:
       if (len == sizeof(CalibrationData)) {
         memcpy(&cal, payload, sizeof(cal));
@@ -376,6 +455,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);   // off
 
+  watchdogReset = IWatchdog.isReset(true);   // a frozen program was restarted by the watchdog
   DEBUG_SERIAL.begin(115200);
   analogReadResolution(12);      // the calibration defaults are 12-bit counts
   pinMode(HALL_PIN, INPUT_ANALOG);
@@ -424,27 +504,63 @@ void setup() {
   }
 
   hallFiltered = analogRead(HALL_PIN);
+  hallFilter.reset(hallFiltered);
+  lastLoadSampleMs = millis();
+  lastLoadSampleUs = micros();
+  IWatchdog.begin(WATCHDOG_US);   // from here a stalled loop restarts the board
 }
 
 void loop() {
+  IWatchdog.reload();
   TinyUSB_Device_Task();
   checkBootloaderTouch();
+
+  static unsigned long lastLoopUs = micros();
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastLoopUs) * 1e-6f;
+  lastLoopUs = nowUs;
+  unsigned long nowMs = millis();
 
   int hallRaw = analogRead(HALL_PIN);          // single sample, kept for STATUS transparency
   int hallOversampled = readHallOversampled();
   static int hallHistory[HALL_MEDIAN_WINDOW];
   static uint8_t hallHistIdx = 0, hallHistCount = 0;
   int hallMedian = pushMedian(hallOversampled, hallHistory, HALL_MEDIAN_WINDOW, &hallHistIdx, &hallHistCount);
-  hallFiltered += (hallMedian - hallFiltered) * HALL_SMOOTHING;
+  hallFiltered = hallFilter.update(hallMedian, dt, max(1.0f, fabsf((float)(cal.hallMax - cal.hallMin))));
 
+  // The HX711 only has a sample every 12.5 ms at 80 SPS: filter on those, with
+  // the time between them, and hold the value in between.
   if (scale.is_ready()) {
-    loadRaw = scale.get_units(1);   // update only when a fresh sample exists
+    long raw = scale.read();
+    float sampleDt = (nowUs - lastLoadSampleUs) * 1e-6f;
+    lastLoadSampleUs = nowUs;
+    lastLoadSampleMs = nowMs;
+    bool atLimit = raw >= 8388607L || raw <= -8388608L;
+    if (!atLimit) loadSaturatedSince = 0;
+    else if (loadSaturatedSince == 0) loadSaturatedSince = nowMs;
+    float relative = (float)(raw - scale.get_offset());
+    float filtered = loadFilter.update(relative, sampleDt, max(1.0f, fabsf((float)(cal.loadMax - cal.loadMin))));
+    loadRaw = lroundf(filtered);
   }
 
+  // Faults: hold the affected axis at 0 and report it.
+  if (hallOversampled < HALL_RAIL_LOW || hallOversampled > HALL_RAIL_HIGH) {
+    if (hallBadSince == 0) hallBadSince = nowMs;
+  } else {
+    hallBadSince = 0;
+  }
+  uint8_t faults = 0;
+  if (hallBadSince != 0 && nowMs - hallBadSince >= HALL_FAULT_MS) faults |= PEDAL_FAULT_HALL_RANGE;
+  if (nowMs - lastLoadSampleMs >= LOAD_SILENT_MS) faults |= PEDAL_FAULT_LOAD_TIMEOUT;
+  if (loadSaturatedSince != 0 && nowMs - loadSaturatedSince >= LOAD_SATURATED_MS) faults |= PEDAL_FAULT_LOAD_SATURATED;
+  bool faultsChanged = faults != activeFaults;
+  activeFaults = faults;
+
   int throttleLinear = constrainMap((long)hallFiltered, cal.hallMin, cal.hallMax, 0, 1023);
-  int throttleAxis   = applyCurve(throttleLinear, cal.throttleCurve);
+  int throttleAxis   = (faults & PEDAL_FAULT_HALL_RANGE) ? 0 : applyCurve(throttleLinear, cal.throttleCurve);
   int brakeLinear    = constrainMap(loadRaw, cal.loadMin, cal.loadMax, 0, 1023);
-  int brakeAxis      = applyCurve(brakeLinear, cal.brakeCurve);
+  int brakeAxis      = (faults & (PEDAL_FAULT_LOAD_TIMEOUT | PEDAL_FAULT_LOAD_SATURATED)) ? 0
+                                                                                      : applyCurve(brakeLinear, cal.brakeCurve);
 
   if (usbHid.ready()) {
     uint16_t axes[2] = { (uint16_t)throttleAxis, (uint16_t)brakeAxis };
@@ -452,6 +568,8 @@ void loop() {
   }
 
   pollCommands();
+
+  if (faultsChanged || millis() - lastInfoSent >= 1000) sendInfo();
 
   if (millis() - lastStatusSent >= STATUS_INTERVAL_MS) {
     lastStatusSent = millis();

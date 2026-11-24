@@ -40,6 +40,8 @@
 #define MSG_GET_CALIBRATION  0x04  // PC -> device, request current calibration
 #define MSG_CALIBRATION      0x84  // device -> PC, current calibration (reply to GET/SET, and once at boot)
 #define MSG_SAVE_ACK         0x83  // device -> PC, 1-byte payload: 1 = flash write ok, 0 = failed
+#define MSG_GET_INFO         0x05  // PC -> device, request a MSG_INFO
+#define MSG_INFO             0x85  // device -> PC, firmware version + faults (reply to GET_INFO, pushed on a change and about once a second)
 
 // PC -> device (MSG_SET_CALIBRATION payload) and device -> PC
 // (MSG_CALIBRATION payload). Same struct both directions so the PC app's
@@ -71,4 +73,21 @@ struct __attribute__((packed)) StatusPacket {
   int32_t  loadRaw;
   uint16_t throttleAxis;   // 0-1023, the same value sent to the HID joystick
   uint16_t brakeAxis;      // 0-1023
+};
+
+// device -> PC (MSG_INFO payload). fwVersion is major << 8 | minor (0x0100 = 1.0),
+// the same scheme as the wheel's. Firmware older than 1.0 never sends this, which
+// is how Volgas knows a board has an old version.
+#define PEDAL_BOARD_BLACKPILL_F411 1
+
+#define PEDAL_FAULT_HALL_RANGE      0x01  // throttle sensor reads at the very top or bottom of the ADC (short or disconnected); throttle held at 0
+#define PEDAL_FAULT_LOAD_TIMEOUT    0x02  // the HX711 stopped sending samples; brake held at 0
+#define PEDAL_FAULT_LOAD_SATURATED  0x04  // the HX711 keeps answering with its maximum value (signal wires open or crossed); brake held at 0
+#define PEDAL_FAULT_WATCHDOG_RESET  0x08  // the last restart was the watchdog catching a frozen program (kept until power is removed)
+
+struct __attribute__((packed)) PedalInfo {
+  uint16_t fwVersion;
+  uint8_t  faults;      // PEDAL_FAULT_* bits
+  uint8_t  boardId;     // PEDAL_BOARD_*
+  uint8_t  protocol;    // PEDAL_PROTOCOL_VERSION
 };

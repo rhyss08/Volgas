@@ -27,13 +27,45 @@ MSG_SAVE = 0x03
 MSG_GET_CALIBRATION = 0x04
 MSG_CALIBRATION = 0x84
 MSG_SAVE_ACK = 0x83
+MSG_GET_INFO = 0x05
+MSG_INFO = 0x85
 
 # Must match pedal_protocol.h byte-for-byte (packed, little-endian).
 CAL_FMT = "<hhii5B5B"        # hallMin hallMax loadMin loadMax throttleCurve[5] brakeCurve[5]
 STATUS_FMT = "<hhiHH"        # hallRaw hallFiltered loadRaw throttleAxis brakeAxis
 CAL_SIZE = struct.calcsize(CAL_FMT)
 STATUS_SIZE = struct.calcsize(STATUS_FMT)
+INFO_FMT = "<HBBB"           # fwVersion faults boardId protocol (firmware 1.0 and later)
+INFO_SIZE = struct.calcsize(INFO_FMT)
 AXIS_MAX = 1023              # the joystick axes are 10-bit
+
+# Fault bits in MSG_INFO, as pedal_protocol.h defines them.
+FAULT_HALL_RANGE = 0x01
+FAULT_LOAD_TIMEOUT = 0x02
+FAULT_LOAD_SATURATED = 0x04
+FAULT_WATCHDOG_RESET = 0x08
+FAULT_TEXT = {
+    FAULT_HALL_RANGE: "the throttle sensor reads outside its range (short or disconnected wire)",
+    FAULT_LOAD_TIMEOUT: "the brake's HX711 isn't sending readings",
+    FAULT_LOAD_SATURATED: "the brake's load cell reads at its limit (signal wires open or crossed)",
+    FAULT_WATCHDOG_RESET: "the pedals restarted after freezing",
+}
+
+
+def parse_info(payload):
+    """{"fw", "faults", "board", "protocol"} from a MSG_INFO payload, or None
+    if it isn't the right size. fw is the 16-bit version (major << 8 | minor)."""
+    if len(payload) != INFO_SIZE:
+        return None
+    fw, faults, board, protocol = struct.unpack(INFO_FMT, payload)
+    return {"fw": fw, "faults": faults, "board": board, "protocol": protocol}
+
+
+def fault_texts(faults, include_restart=False):
+    """Plain-language lines for the fault bits that are set (the restart note
+    only when asked: it's history, not something to fix)."""
+    return [text for bit, text in FAULT_TEXT.items()
+            if faults & bit and (include_restart or bit != FAULT_WATCHDOG_RESET)]
 
 
 def find_pedal_port():

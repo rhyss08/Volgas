@@ -63,20 +63,22 @@ from tkinter import font as tkfont
 import certifi
 import serial
 import serial.tools.list_ports
-from collections import deque
+from collections import Counter, deque
 from PIL import Image, ImageDraw, ImageTk
 
 import volgas_dash_font
 import volgas_buttons as vbtn
 import volgas_devices as devs
 import volgas_theme as T
+import volgas_pedal_update
 import volgas_ui as ui
 import volgas_wheel_ota
 from volgas_theme import px
 from volgas_log import setup_logging
 from volgas_pedal_protocol import (
     MSG_STATUS, MSG_SET_CALIBRATION, MSG_SAVE, MSG_GET_CALIBRATION,
-    MSG_CALIBRATION, MSG_SAVE_ACK, CAL_FMT, STATUS_FMT, CAL_SIZE, STATUS_SIZE, AXIS_MAX,
+    MSG_CALIBRATION, MSG_SAVE_ACK, MSG_GET_INFO, MSG_INFO, CAL_FMT, STATUS_FMT, CAL_SIZE, STATUS_SIZE, AXIS_MAX,
+    parse_info, fault_texts,
     THROTTLE_LIMITS, BRAKE_LIMITS, CAPTURE_SECONDS, find_pedal_port, build_frame, FrameParser,
     summarise, check_calibration, linear_fraction)
 from volgas_settings import data_dir, log_dir, load_settings as _load_settings, save_settings as _save_settings
@@ -288,7 +290,7 @@ WHEEL_SETTLE_MS = 150  # full-quality redraw this long after the wheel or the wi
 WHEEL_BUTTONS = 12  # buttons on the wheel (the hub's hello says so too); the lights and the calibration cover these
 WHEEL_MIN_ANGLE_STEP = 0.1  # degrees; smaller position changes don't redraw the photo
 CARD_PAD = 16  # inset between a card's edge and its contents
-WHEEL_CENTRE_BUTTON_Y = CARD_PAD + 20 + 22  # top of Set Centre: just under the angle readout centred at CARD_PAD + 20
+WHEEL_CENTRE_BUTTON_Y = CARD_PAD  # top of Set Centre, at the top of the Wheelbase page's wheel card; the angle readout sits under it
 
 # Wheelbase tab card rows (see _add_wb_slider_row)
 WB_ROWS_TOP = CARD_PAD + 4
@@ -663,7 +665,8 @@ DEFAULT_THROTTLE_CURVE = (0, 44, 66, 84, 100)
 DEFAULT_BRAKE_CURVE = CURVE_PRESET_LINEAR
 
 
-def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=18, interior_leak_min_area=400):
+def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=18, interior_leak_min_area=400,
+                                     interior_leak_min_flat=0.35):
     """Matte out volgas_wheel.png's "transparency" checkerboard (baked into
     the actual pixels as flat gray/white squares, not real alpha - the
     source PNG is fully opaque, see the render that produced it), so only
@@ -693,9 +696,14 @@ def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=1
          Rather than hardcoded patch rectangles, this finds any remaining
          checker-classified connected component and keys it out too *if*
          it's large - real leaks here are 1000+ px, while the legitimate
-         small light details (rivet highlights etc.) that must NOT be
-         touched are all under ~300px, so a size cutoff cleanly tells them
-         apart without needing to hand-locate anything.
+         small light details (rivet highlights etc.) are mostly under
+         ~300px. Size alone isn't enough, though: the white button and the
+         logo's biggest silver stroke are 400-600 px too. What separates
+         them is that the checkerboard is two FLAT tones (the ones pass 1
+         just removed), so a leak must also have at least
+         `interior_leak_min_flat` of its pixels sitting on those two tones;
+         the shaded button and logo have under a quarter, the real leaks
+         over half.
     """
     img = img.convert("RGBA")
     w, h = img.size
@@ -740,6 +748,27 @@ def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=1
                     for cx, cy in flood(x, y, visited):
                         keyed[cy * w + cx] = 1
 
+    # The checkerboard's two flat tones (average of r, g, b), read off what pass 1 removed.
+    counts = Counter()
+    for i in range(w * h):
+        if keyed[i]:
+            r, g, b = px[i % w, i // w][:3]
+            counts[(r + g + b) // 3] += 1
+    tones = []
+    for value, _n in counts.most_common():
+        if all(abs(value - t) > 10 for t in tones):
+            tones.append(value)
+        if len(tones) == 2:
+            break
+
+    def flat_share(comp):
+        near = 0
+        for cx, cy in comp:
+            r, g, b = px[cx, cy][:3]
+            if any(abs((r + g + b) // 3 - t) <= 4 for t in tones):
+                near += 1
+        return near / len(comp)
+
     # Pass 2: large interior leaks.
     visited2 = bytearray(w * h)
     for y in range(h):
@@ -751,7 +780,7 @@ def _key_out_checkerboard_background(img, fill, brightness_min=150, spread_max=1
             if not is_bg(*px[x, y][:3]):
                 continue
             comp = flood(x, y, visited2)
-            if len(comp) >= interior_leak_min_area:
+            if len(comp) >= interior_leak_min_area and flat_share(comp) >= interior_leak_min_flat:
                 for cx, cy in comp:
                     keyed[cy * w + cx] = 1
 
@@ -843,7 +872,6 @@ class VolgasApp:
         # (_add_wb_slider_row / _add_wb_switch_row), kept in step by _on_wb_settings.
         self.wb_field_vars = {}
         self.wb_connected = False
-        self._wb_unsaved = False  # settings changed in the board's RAM since the last Save & Reboot
 
         # The last values read from (or written to) the wheelbase, kept in
         # volgas_settings.json ("wheelbase": {field: value}) so the page shows
@@ -888,7 +916,11 @@ class VolgasApp:
         self._dev_checked = set()      # devices whose check result is shown
         self._dev_error = None         # why the last device check failed
         self._dev_busy = False         # a device check is running
-        self._dev_update_busy = False  # a wheel firmware update is running
+        self._dev_update_busy = False  # a device firmware update is running
+        self._dev_updating = None      # which device (key) the running update is for
+        self.pedal_info = None         # the pedals' MSG_INFO (firmware version, faults); None for older firmware
+        self._pedal_faults_shown = 0   # fault bits already announced
+        self._pedals_paused = False    # no auto-connect while the pedals are being updated
         self._dev_text = {}            # device -> status text of the running/last update
         self._dev_queue = queue.Queue()
         self._button_markers = []      # every WheelButtonMarkers on screen (Home wheel card, Wheel page)
@@ -1582,8 +1614,8 @@ class VolgasApp:
             # sit under the angle text above it.
             if wheelbase_controls:
                 canvas.coords(image_id, w / 2, h / 2 + WHEEL_VERTICAL_OFFSET)
-                canvas.coords(text_id, w / 2, CARD_PAD + px(20))
                 canvas.coords(centre_id, w / 2, WHEEL_CENTRE_BUTTON_Y)
+                canvas.coords(text_id, w / 2, WHEEL_CENTRE_BUTTON_Y + centre_btn.winfo_reqheight() + px(18))
             else:
                 canvas.coords(image_id, w / 2, (header_h + h - footer_h) / 2)
                 canvas.coords(pill_id, w - T.SPACE_4, T.SPACE_4 + px(12))
@@ -1611,8 +1643,8 @@ class VolgasApp:
             canvas.bind("<Configure>", on_resize, add="+")
             self._wheel_cards.append((canvas, draw))
             return canvas
-        text_id = canvas.create_text(0, CARD_PAD + px(20), text="0°", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
-        # Set Centre sits right under the angle readout it zeroes. Card
+        text_id = canvas.create_text(0, CARD_PAD + px(44), text="0°", fill=MAIN_TEXT, font=("Segoe UI", 16, "bold"))
+        # Set Centre sits right above the angle readout it zeroes. Card
         # background colour (MAIN_BORDER on MAIN_PANEL) so it stays visible on
         # the panel, unlike the top bar's MAIN_PANEL-on-MAIN_BG it used to be.
         centre_btn = tk.Button(canvas, text="Set Centre", font=("Segoe UI", 9), fg=MAIN_TEXT,
@@ -2257,8 +2289,7 @@ class VolgasApp:
 
         # One card, one list: the Forces switch, the effect settings, the
         # Integrated Spring switch, then the hardware settings, with no
-        # section headings (user, 2026-10-23), and the Power Limit caution as
-        # the last line.
+        # section headings (user, 2026-10-23).
         rows = ([("switch", "ForceEnabled")] + [("slider", k) for k in effect_keys]
                 + [("switch", "IntegratedSpringStrength")] + [("slider", k) for k in hardware_keys])
         # A copy of the Main tab's wheel card at the top, centred, filling all
@@ -2266,7 +2297,7 @@ class VolgasApp:
         # is packed first (from the bottom) so if the window is short it's the
         # wheel card that gives up height, never the settings. Small
         # requested sizes so this tab doesn't raise the window's minimum size.
-        card = self._make_flat_card(parent, px(520), WB_ROWS_TOP + (len(rows) + 1) * WB_ROW_H + CARD_PAD)
+        card = self._make_flat_card(parent, px(520), WB_ROWS_TOP + len(rows) * WB_ROW_H + CARD_PAD)
         card.pack(side="bottom", fill="x", padx=px(20), pady=(0, px(20)))
         wheel_card = self._build_wheel_card(parent, 200, 160)  # 100% sizes
         wheel_card.pack(side="top", fill="y", expand=True, pady=(0, px(12)))
@@ -2287,9 +2318,6 @@ class VolgasApp:
                 self._add_wb_switch_row(card, WB_ROWS_TOP + i * WB_ROW_H, name_w, key, label, on_value)
             else:
                 self._add_wb_slider_row(card, WB_ROWS_TOP + i * WB_ROW_H, key, name_w)
-        card.create_text(CARD_PAD + px(4), WB_ROWS_TOP + len(rows) * WB_ROW_H + WB_ROW_H / 2,
-                         text="Power Limit is a torque-limiting safety field - raise with care.",
-                         font=("Segoe UI", 9), fill=MAIN_ORANGE_STATUS, anchor="w")
 
         # Tk on Windows sends <MouseWheel> / key presses to the focused widget,
         # not the one under the pointer - so the card takes focus on hover and
@@ -2826,9 +2854,11 @@ class VolgasApp:
         self.ser, self._pedal_stop, self.reader = ser, stop, reader
         self._cal_loaded = False
         self.last_status = None
+        self.pedal_info = None
         log.info("pedals connected on %s", port)
         reader.start()
         self._request_cal()
+        self._send(build_frame(MSG_GET_INFO), quiet=True)
 
     def _disconnect(self, reason=None):
         ser, self.ser = self.ser, None
@@ -2847,6 +2877,8 @@ class VolgasApp:
             log.info("pedals disconnected%s", f" ({reason})" if reason else "")
         self._cal_loaded = False
         self.last_status = None
+        self.pedal_info = None
+        self._pedal_faults_shown = 0
         if hasattr(self, "main_throttle_update"):
             self.main_throttle_update(None)
             self.main_brake_update(None)
@@ -2854,7 +2886,7 @@ class VolgasApp:
     def _auto_scan(self):
         if self._closing:
             return
-        if not self.ser:
+        if not self.ser and not self._pedals_paused:
             port = find_pedal_port()
             if port:
                 self._connect_to(port)
@@ -2946,9 +2978,6 @@ class VolgasApp:
         WB_SLIDER_SPECS)."""
         if self.wb_connected:
             self.wb_cmd_queue.put(("send_setting", name, value))
-            if not self._wb_unsaved:
-                self._wb_unsaved = True
-                self._update_wb_status()
 
     def _wb_verify(self, name, value):
         """Read the board back after a change: FFBeast silently ignores some
@@ -2964,8 +2993,6 @@ class VolgasApp:
             text, color = "Wheelbase support couldn't load - see the log", T.STATUS_ERROR
         elif not self.wb_connected:
             text, color = "Looking for the wheelbase...", T.TEXT_SECONDARY
-        elif self._wb_unsaved:
-            text, color = "Changed, not saved - Save & Reboot keeps the changes after a restart", T.STATUS_WARN
         else:
             text, color = "Connected - showing the wheelbase's own settings", T.STATUS_OK
         self.wb_status_label.config(text=text, fg=color)
@@ -3057,7 +3084,6 @@ class VolgasApp:
                     latest_state = msg[1]
                 elif kind == "connected":
                     self.wb_connected = True
-                    self._wb_unsaved = False
                     self._adopt_wb_settings(msg[1])
                     changed = True
                 elif kind == "settings":
@@ -3066,7 +3092,6 @@ class VolgasApp:
                     self._notify(f"The wheelbase didn't accept the change to {_wb_display_name(msg[1])} and kept "
                                  "its own value. FFBeast's free mode may lock this setting.", "warn")
                 elif kind == "saved":
-                    self._wb_unsaved = False
                     changed = True
                     self._notify("Saved to the wheelbase. It restarts and reconnects in a few seconds.", "info")
                 elif kind == "disconnected":
@@ -3126,6 +3151,8 @@ class VolgasApp:
                     self._on_status(struct.unpack(STATUS_FMT, payload))
                 elif msg_type == MSG_CALIBRATION and len(payload) == CAL_SIZE:
                     self._on_calibration(struct.unpack(CAL_FMT, payload))
+                elif msg_type == MSG_INFO:
+                    self._on_pedal_info(parse_info(payload))
                 elif msg_type == MSG_SAVE_ACK and len(payload) == 1:
                     ok = payload[0] == 1
                     if ok:
@@ -3139,6 +3166,21 @@ class VolgasApp:
         except queue.Empty:
             pass
         self.root.after(30, self._poll)
+
+    def _on_pedal_info(self, info):
+        """The pedals' firmware version and faults (firmware 1.0 and later). A fault is announced once
+        when it appears and shown on the Pedals page until it's gone."""
+        if info is None:
+            return
+        self.pedal_info = info
+        faults = info["faults"] & ~0x08   # the "restarted after freezing" note isn't a live fault
+        new = faults & ~self._pedal_faults_shown
+        if new:
+            self._notify("Pedal fault: " + "; ".join(fault_texts(new)) + ".", "warn")
+        if faults != self._pedal_faults_shown:
+            self._set_pedal_status("Fault: " + "; ".join(fault_texts(faults)) if faults else "",
+                                   "warn" if faults else "idle")
+        self._pedal_faults_shown = faults
 
     def _on_status(self, st):
         self.last_status = st  # raw hall/load fields still consumed directly by the calibrate wizard
@@ -3187,14 +3229,14 @@ class VolgasApp:
             states["dash"] = ("error", "Dash unavailable", False)
             states["hub"] = ("error", "Hub unavailable", False)
         elif not bridge.connected:
-            states["dash"] = ("idle", "Dash not found", False)
+            states["dash"] = ("idle", "Wheel not connected", False)
             states["hub"] = ("idle", "Hub not found", False)
         elif bridge.is_hub:
             states["hub"] = ("ok", "Hub connected", True)
             if bridge.hub_status[1]["linked"]:
                 states["dash"] = ("ok", "Dash connected", True)
             else:
-                states["dash"] = ("warn", "Dash not linked", False)
+                states["dash"] = ("warn", "Wheel not connected", False)
         elif now - bridge.connected_at < 3.0:
             # The hub hasn't answered yet; don't flash "hub not found".
             states["hub"] = ("idle", "Hub connecting", True)
@@ -3297,11 +3339,6 @@ class VolgasApp:
         buttons = tk.Frame(right, bg=MAIN_PANEL)
         buttons.pack()
         ui_ = {"pill": pill, "pill_shown": False, "info": info, "result": result, "buttons": buttons}
-        ui_["file"] = None
-        if key == "dash":
-            ui_["file"] = ui.FlatButton(buttons, "From file...", command=self._update_dash_from_file,
-                                        font=T.FONT_CAPTION)
-            ui_["file"].pack(side="left", padx=(0, T.SPACE_2))
         ui.FlatButton(buttons, "Check", command=lambda: self._check_updates({key}),
                       font=T.FONT_CAPTION).pack(side="left")
         ui_["update"] = ui.FlatButton(buttons, "Update", command=lambda: self._install_device_update(key),
@@ -3319,6 +3356,9 @@ class VolgasApp:
             versions["dash"] = devs.format_wheel_version(bridge.hub_status[1]["fw"])
         if self.wb_connected:
             versions["wheelbase"] = self._wb_fw
+        if self.ser is not None:   # connected: a version if it reports one, else "older than 1.0"
+            info = self.pedal_info
+            versions["pedals"] = devs.format_wheel_version(info["fw"]) if info else devs.UNVERSIONED
         return versions
 
     def _check_text(self, key, installed):
@@ -3363,6 +3403,8 @@ class VolgasApp:
             installed = versions[key]
             if not connected:
                 info = "Not connected"
+            elif installed == devs.UNVERSIONED:
+                info = "Installed: older firmware (it doesn't report a version)"
             elif installed is not None:
                 info = f"Installed: firmware {installed}"
             else:
@@ -3375,9 +3417,7 @@ class VolgasApp:
                    and self._update_available(key, installed))
             ui_["update"].set_enabled(can)
             any_update = any_update or (self._update_available(key, installed) and key in devs.UPDATABLE)
-            if ui_["file"] is not None:
-                ui_["file"].set_enabled(connected and not self._dev_update_busy)
-            busy = self._dev_update_busy and key == "dash"
+            busy = self._dev_update_busy and key == self._dev_updating
             if busy and not ui_["bar"].winfo_ismapped():
                 ui_["buttons"].pack_forget()
                 ui_["bar"].pack()
@@ -3405,18 +3445,19 @@ class VolgasApp:
                     self._dev_error = ("no public release found" if isinstance(err, urllib.error.HTTPError)
                                        and err.code == 404 else str(err))
                     log.info("device update check failed: %s", err)
-                elif kind == "progress":   # (progress, fraction, text)
-                    self._dev_text["dash"] = msg[2]
-                    self._dev_ui["dash"]["bar"].config(value=msg[1] * 100)
-                elif kind == "done":       # (done, old, new)
-                    self._dev_update_busy = False
-                    self._dev_text.pop("dash", None)
-                    self._notify(f"Dash updated: firmware {devs.format_wheel_version(msg[1])} to "
-                                 f"{devs.format_wheel_version(msg[2])}.", "info")
-                elif kind == "failed":     # (failed, text)
-                    self._dev_update_busy = False
-                    self._dev_text.pop("dash", None)
-                    self._notify(f"Dash update failed: {msg[1]}", "error")
+                elif kind == "progress":   # (progress, device, fraction, text)
+                    self._dev_text[msg[1]] = msg[3]
+                    self._dev_ui[msg[1]]["bar"].config(value=msg[2] * 100)
+                elif kind == "done":       # (done, device, old, new, extra)
+                    self._dev_update_busy, self._dev_updating = False, None
+                    self._dev_text.pop(msg[1], None)
+                    old = devs.format_wheel_version(msg[2]) or "an older version"
+                    self._notify(f"{devs.DEVICE_NAMES[msg[1]]} updated: firmware {old} to "
+                                 f"{devs.format_wheel_version(msg[3])}." + (msg[4] or ""), "info")
+                elif kind == "failed":     # (failed, device, text)
+                    self._dev_update_busy, self._dev_updating = False, None
+                    self._dev_text.pop(msg[1], None)
+                    self._notify(f"{devs.DEVICE_NAMES[msg[1]]} update failed: {msg[2]}", "error")
         except queue.Empty:
             pass
         self._refresh_updates_page()   # also keeps the nav badge current from any page
@@ -3445,28 +3486,58 @@ class VolgasApp:
         threading.Thread(target=work, daemon=True, name="device-update-check").start()
 
     def _install_device_update(self, key):
-        if key != "dash":
+        if key not in devs.UPDATABLE:
             return
-        entry = (self._dev_manifest or {}).get("dash")
+        entry = (self._dev_manifest or {}).get(key)
         if entry is None:
             return
-        self._start_dash_update(f"firmware {entry['version']}", entry=entry)
+        if key == "pedals":
+            self._start_pedal_update(f"firmware {entry['version']}", entry=entry)
+        else:
+            self._start_dash_update(f"firmware {entry['version']}", entry=entry)
 
-    def _update_dash_from_file(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            title="Dash firmware", filetypes=[("Firmware", "*.bin"), ("All files", "*.*")])
-        if not path:
+    def _start_pedal_update(self, what, entry=None, image=None):
+        """Put new firmware on the pedals over USB (volgas_pedal_update): the pedals restart into the
+        chip's bootloader, get flashed, and Volgas puts their calibration back. The pedal connection
+        is let go of for the duration and auto-connect paused."""
+        if self._dev_update_busy:
             return
-        try:
-            with open(path, "rb") as f:
-                image = f.read()
-        except OSError as e:
-            self._notify(f"Couldn't read the file ({e}).", "error")
+        if not messagebox.askyesno(
+                "Update pedals", f"Update the pedals to {what}?\n\nThis takes about a minute. The pedals stop "
+                                 "working meanwhile - don't unplug them. Your calibration is saved first and "
+                                 "put back afterwards."):
             return
-        self._start_dash_update(os.path.basename(path), image=image)
+        self._dev_update_busy, self._dev_updating = True, "pedals"
+        self._dev_text["pedals"] = "Starting..."
+        self._pedals_paused = True
+        port = find_pedal_port()
+        self._disconnect("updating")
 
-    def _start_dash_update(self, what, entry=None, image=None):
+        def work():
+            try:
+                data = image
+                if data is None:
+                    self._dev_queue.put(("progress", "pedals", 0.0, "Downloading..."))
+                    data = devs.download_firmware(_http_get, entry)
+
+                def progress(fraction, text):
+                    self._dev_queue.put(("progress", "pedals", fraction, text))
+
+                old, new, kept = volgas_pedal_update.update_pedals(
+                    data, port=port, progress=progress, log=log.info)
+                self._dev_queue.put(("done", "pedals", old, new, "" if kept else " Calibrate the pedals again."))
+            except volgas_pedal_update.PedalUpdateError as e:
+                log.warning("pedal update failed: %s", e)
+                self._dev_queue.put(("failed", "pedals", str(e)))
+            except Exception as e:
+                log.exception("pedal update failed")
+                self._dev_queue.put(("failed", "pedals", str(e)))
+            finally:
+                self._pedals_paused = False
+
+        threading.Thread(target=work, daemon=True, name="pedal-update").start()
+
+    def _start_dash_update(self, what, entry):
         """Send firmware to the wheel through the hub. The dash bridge lets go
         of the hub's port for the duration (it normally holds it)."""
         bridge = self._dash_bridge
@@ -3479,17 +3550,15 @@ class VolgasApp:
                 "Update dash", f"Send {what} to the dash through the hub?\n\nThe car must be parked. The dash "
                                "shows its progress and restarts when it's done; this takes a few minutes."):
             return
-        self._dev_update_busy = True
+        self._dev_update_busy, self._dev_updating = True, "dash"
         self._dev_text["dash"] = "Starting..."
         port = bridge.port
 
         def work():
             try:
-                data = image
-                if data is None:
-                    self._dev_queue.put(("progress", 0.0, "Downloading..."))
-                    data = devs.download_firmware(_http_get, entry)
-                self._dev_queue.put(("progress", 0.0, "Waiting for the hub's port..."))
+                self._dev_queue.put(("progress", "dash", 0.0, "Downloading..."))
+                data = devs.download_firmware(_http_get, entry)
+                self._dev_queue.put(("progress", "dash", 0.0, "Waiting for the hub's port..."))
                 if not bridge.pause():
                     raise volgas_wheel_ota.OtaError("couldn't free the hub's port")
                 try:
@@ -3498,15 +3567,15 @@ class VolgasApp:
                     def progress(done, total):
                         if done * 100 // total != last[0]:
                             last[0] = done * 100 // total
-                            self._dev_queue.put(("progress", done / total, f"Sending... {last[0]}%"))
+                            self._dev_queue.put(("progress", "dash", done / total, f"Sending... {last[0]}%"))
 
                     old, new = volgas_wheel_ota.update_wheel(data, port=port, progress=progress, log=log.info)
                 finally:
                     bridge.resume()
-                self._dev_queue.put(("done", old, new))
+                self._dev_queue.put(("done", "dash", old, new, ""))
             except Exception as e:
                 log.exception("dash update failed")
-                self._dev_queue.put(("failed", str(e)))
+                self._dev_queue.put(("failed", "dash", str(e)))
 
         threading.Thread(target=work, daemon=True, name="dash-update").start()
 
@@ -3725,7 +3794,7 @@ class VolgasApp:
         self._cal_loaded = True
         self._redraw_pedal_curve("throttle")
         self._redraw_pedal_curve("brake")
-        self._set_pedal_status("Calibration read from the pedals", "ok")
+        self._set_pedal_status("")
 
 
 DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2

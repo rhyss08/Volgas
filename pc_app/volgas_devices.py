@@ -25,7 +25,7 @@ DEVICE_NAMES = {
 
 # Which devices Volgas can actually update. The others show up on the Updates
 # page with their version and a check, but their update isn't built yet.
-UPDATABLE = {"dash"}
+UPDATABLE = {"dash", "pedals"}
 
 MANIFEST_ASSET = "firmware.json"
 
@@ -48,6 +48,11 @@ def version_tuple(version):
         return None
     nums = re.findall(r"\d+", str(version))
     return tuple(int(n) for n in nums) if nums else None
+
+
+# Stands for "a device that answers but has firmware too old to report a version":
+# it compares as older than anything published.
+UNVERSIONED = "0"
 
 
 def compare(installed, available):
