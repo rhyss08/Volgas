@@ -132,6 +132,7 @@ class WheelButtonMarkers:
     def __init__(self, canvas, count, tag="wheel_buttons", numbers="never", idle="none"):
         self.canvas, self.count, self.numbers, self.idle = canvas, count, numbers, idle
         self.parts = [None] * count
+        self._painted = [None] * count   # what each highlight currently looks like, to restyle only on a change
         self._lit = self._assigned = 0
         self._focus = None
         self._geom = None
@@ -147,6 +148,7 @@ class WheelButtonMarkers:
 
     def set_parts(self, parts):
         self.parts = (list(parts) + [None] * self.count)[:self.count]
+        self._painted = [None] * self.count
         self.layout()
 
     def place(self, cx, cy, size, angle_deg=0.0):
@@ -154,53 +156,79 @@ class WheelButtonMarkers:
         self.layout()
 
     def layout(self):
+        """Put every visible highlight where the photo has it. Highlights that
+        aren't shown (the idle ones on Home) cost nothing here, and a
+        highlight is restyled only when its look changed: this runs on every
+        redraw of the turning wheel, so it has to be cheap."""
         if self._geom is None:
             return
         cx, cy, size, angle = self._geom
         turn = vb.rotator(angle)
+        numbers = self.numbers == "always"
         for i in range(self.count):
             part = self.parts[i]
-            if part is None or size <= 0:
-                for items in (self._ovals, self._polys, self._shadows, self._labels):
-                    self.canvas.itemconfig(items[i], state="hidden")
+            style = self._style(i) if part is not None and size > 0 else None
+            if style is None and not (numbers and part is not None and size > 0):
+                self._hide(i)
                 continue
             shape = vb.PARTS[part]
-            if shape[0] == "circle":
+            circle = shape[0] == "circle"
+            if circle:
                 dx, dy = turn(shape[1], shape[2])
                 x, y, r = cx + dx * size, cy + dy * size, shape[3] * size
-                self.canvas.coords(self._ovals[i], x - r, y - r, x + r, y + r)
+                if style is not None:
+                    self.canvas.coords(self._ovals[i], x - r, y - r, x + r, y + r)
             else:
-                flat = []
-                for fx, fy in shape[1]:
-                    dx, dy = turn(fx, fy)
-                    flat += [cx + dx * size, cy + dy * size]
-                self.canvas.coords(self._polys[i], *flat)
+                if style is not None:
+                    flat = []
+                    for fx, fy in shape[1]:
+                        dx, dy = turn(fx, fy)
+                        flat += [cx + dx * size, cy + dy * size]
+                    self.canvas.coords(self._polys[i], *flat)
                 mx, my = vb.part_centre(part)
                 dx, dy = turn(mx, my)
                 x, y = cx + dx * size, cy + dy * size
-            self.canvas.coords(self._shadows[i], x + 1, y + 1)
-            self.canvas.coords(self._labels[i], x, y)
-            self._paint(i, shape[0] == "circle")
+            if numbers:
+                self.canvas.coords(self._shadows[i], x + 1, y + 1)
+                self.canvas.coords(self._labels[i], x, y)
+            self._paint(i, circle, style, numbers)
 
-    def _paint(self, i, circle):
+    def _style(self, i):
+        """How button i's highlight looks right now, or None for not shown."""
+        circle = self.parts[i] is not None and vb.PARTS[self.parts[i]][0] == "circle"
+        if self._lit >> i & 1:
+            return (T.ACCENT, "", 0) if circle else ("", T.ACCENT, 4)
+        if self._focus == i:
+            return ("", T.ACCENT, 3)
+        if self._assigned >> i & 1:
+            return ("", T.STATUS_OK, 3)
+        if self.idle == "outline":
+            return ("", "#9aa3b2", 1)
+        return None
+
+    def _hide(self, i):
+        if self._painted[i] == "hidden":
+            return
+        self._painted[i] = "hidden"
+        for items in (self._ovals, self._polys, self._shadows, self._labels):
+            self.canvas.itemconfig(items[i], state="hidden")
+
+    def _paint(self, i, circle, style, numbers):
+        key = (circle, style, numbers)
+        if self._painted[i] == key:
+            return
+        self._painted[i] = key
         shown, other = (self._ovals[i], self._polys[i]) if circle else (self._polys[i], self._ovals[i])
         self.canvas.itemconfig(other, state="hidden")
-        lit = self._lit >> i & 1
-        if lit:
-            style = {"fill": T.ACCENT, "outline": ""} if circle else {"fill": "", "outline": T.ACCENT, "width": 4}
-        elif self._focus == i:
-            style = {"fill": "", "outline": T.ACCENT, "width": 3}
-        elif self._assigned >> i & 1:
-            style = {"fill": "", "outline": T.STATUS_OK, "width": 3}
-        elif self.idle == "outline":
-            style = {"fill": "", "outline": "#9aa3b2", "width": 1}
-        else:
-            style = None
         if style is None:
             self.canvas.itemconfig(shown, state="hidden")
         else:
-            self.canvas.itemconfig(shown, state="normal", **style)
-        number = "normal" if self.numbers == "always" else "hidden"
+            fill, outline, width = style
+            options = {"fill": fill, "outline": outline}
+            if width:
+                options["width"] = width
+            self.canvas.itemconfig(shown, state="normal", **options)
+        number = "normal" if numbers else "hidden"
         self.canvas.itemconfig(self._shadows[i], state=number)
         self.canvas.itemconfig(self._labels[i], state=number)
 

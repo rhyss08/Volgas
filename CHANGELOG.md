@@ -1,18 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 (2026-11-25)
 
-### Pedals (new firmware 1.0 for the Black Pill)
-- **Volgas can update the pedals' firmware** (Settings -> Device updates -> Pedals). It saves the calibration, restarts the pedals into their USB bootloader by itself (no button), writes and checks the new firmware, then puts the calibration back and confirms it. It needs ST's free STM32CubeProgrammer installed. If an update is interrupted, the pedals stay in the bootloader and running the update again finishes it.
+### Pedals (new firmware 1.1 for the Black Pill)
+- **Volgas can update the pedals' firmware** (Settings -> Device updates -> Pedals). It saves the calibration, restarts the pedals into their USB bootloader by itself (no button), writes and checks the new firmware, then puts the calibration back and confirms it. It needs ST's free STM32CubeProgrammer installed. If an update is interrupted, the pedals stay in the bootloader and running the update again finishes it. This release carries the firmware, so the Pedals card offers it.
 - **Adaptive filter:** both pedals are smoothed heavily while still and hardly at all while moving, so they are steady at rest and quick on a stab.
 - **Brake read at 80 samples a second** (the HX711 module's RATE pad tied high; it still works at 10).
 - **Safety:** a hardware watchdog restarts a frozen program; the throttle drops to 0 if its sensor reads at the very top or bottom of its range; the brake drops to 0 if the HX711 stops answering or keeps answering with its maximum (open or crossed wires). The fault is announced in Volgas and shown on the Pedals page.
-- **The pedals report their firmware version**, which the Pedals card in Device updates now shows. Older firmware shows as "older firmware" and is offered the update.
+- **The pedals report their firmware version**, which the Pedals card in Device updates shows. Older firmware shows as "older firmware" and is offered the update.
+- **The live readings are sent 100 times a second** (50 before), and the pedal bars in Volgas follow them closely: Volgas used to hold the pedals' readings back until 64 bytes or 50 ms had arrived, so they came in bunches up to 60 ms late.
 
 ### Interface
-- Wheelbase page: Set Centre is above the steering angle, and the Power Limit warning and the "Changed, not saved" message are gone.
-- Pedals page: the "Calibration read from the pedals" message is gone.
-- The wheel photo is drawn whole again: the white button and the V of the logo were being cut out by the background removal.
+- The wheel picture follows the wheelbase as quickly as the pedal bars: it's redrawn about twice as often (about 60 times a second in a fast turn, up from 31) and each redraw takes about a quarter of the time. While the wheel turns fast the photo is rotated without smoothing, then redrawn in full quality when it slows down.
+- Volgas asks Windows for a finer timer, which was holding every 8 ms update (pedals, wheel) to Windows' 15.6 ms tick.
+- The wheel photo is drawn whole again: the white button and the V of the logo were being cut out by the background removal. The right paddle's outline follows its own shape.
+- Wheelbase page: Set Centre is above the steering angle, and the Power Limit warning and the "Changed, not saved" message are gone. Pedals page: the "Calibration read from the pedals" message is gone.
+- When the wheel isn't connected, Volgas says "Wheel not connected".
 - Device updates: the dash card's "From file..." button is gone.
 
 ## Dash firmware 5.3 (2026-11-19, added to the 0.3.3 release)

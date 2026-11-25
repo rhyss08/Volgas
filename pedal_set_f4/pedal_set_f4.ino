@@ -52,7 +52,7 @@
 
 // Firmware version: major << 8 | minor, like the wheel's (0x0100 = 1.0). Bump it
 // on every release - Volgas compares it with the published firmware.
-#define PEDAL_FW_VERSION 0x0100
+#define PEDAL_FW_VERSION 0x0101
 
 #define USB_VID 0x1EAF
 #define USB_PID 0x0004   // the Blue Pill pedals were 0x0003; a new id so Windows never mixes their descriptors
@@ -84,7 +84,7 @@ const unsigned long LOAD_SILENT_MS = 500;  // no HX711 sample for this long = fa
 const unsigned long LOAD_SATURATED_MS = 500;
 const unsigned long WATCHDOG_US = 2000000; // restart if the main loop stalls for 2 s (a flash save takes up to ~1 s)
 
-const unsigned long STATUS_INTERVAL_MS = 20;   // 50 Hz, only while the PC has the port open
+const unsigned long STATUS_INTERVAL_MS = 10;   // 100 Hz (50 Hz in firmware 1.0), only while the PC has the port open
 
 // HID joystick: X = throttle, Y = brake, 0..1023, two 16-bit fields.
 uint8_t const hidReportDescriptor[] = {

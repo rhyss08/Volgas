@@ -6,6 +6,7 @@ as the HID joystick). Protocol mirror of pedal_set/pedal_protocol.h.
 Requires: pip install pyserial
 """
 
+import atexit
 import ctypes
 import hashlib
 import json
@@ -108,7 +109,7 @@ except Exception:
 
 # Bump on every GitHub Release (tag vX.Y.Z) - the in-app updater will compare
 # this against the latest release's tag.
-VOLGAS_VERSION = "0.3.3"
+VOLGAS_VERSION = "0.3.4"
 
 # In-app updates come from this repo's GitHub Releases: each release carries
 # Volgas.exe plus Volgas.exe.sha256 ("<hash>  Volgas.exe"). See the Settings
@@ -289,6 +290,8 @@ WHEEL_RESIZE_THROTTLE_MS = 33
 WHEEL_SETTLE_MS = 150  # full-quality redraw this long after the wheel or the window stops changing
 WHEEL_BUTTONS = 12  # buttons on the wheel (the hub's hello says so too); the lights and the calibration cover these
 WHEEL_MIN_ANGLE_STEP = 0.1  # degrees; smaller position changes don't redraw the photo
+WHEEL_ROUGH_DEG_PER_S = 90  # turning faster than this, the photo is rotated without smoothing (1 ms, not 8): the
+                            # picture keeps up with the base, and the eye can't see the jagged edges in motion
 CARD_PAD = 16  # inset between a card's edge and its contents
 WHEEL_CENTRE_BUTTON_Y = CARD_PAD  # top of Set Centre, at the top of the Wheelbase page's wheel card; the angle readout sits under it
 
@@ -1555,11 +1558,13 @@ class VolgasApp:
                 state["size"], state["base_fast"] = size, fast
                 state["base"] = self._wheel_flat_full.resize((size, size), Image.BILINEAR if fast else Image.LANCZOS)
 
-        def draw(angle_deg, fast=False):
+        def draw(angle_deg, fast=False, rough=False):
             """fast: a cheaper rotation while the wheel moves or the window
             is being resized (a full-quality rotation of a large photo took
-            20-35 ms); a full-quality frame follows once things settle."""
-            key = (round(angle_deg, 2), state["size"], fast or state["base_fast"])
+            20-35 ms); a full-quality frame follows once things settle.
+            rough: the cheapest one (no smoothing, about 1 ms), while the
+            wheel turns quickly."""
+            key = (round(angle_deg, 2), state["size"], fast or state["base_fast"], rough)
             if key == state["drawn"]:
                 return
             state["drawn"] = key
@@ -1570,8 +1575,9 @@ class VolgasApp:
             # here so a positive angle_deg (matching the FFBeast Position/turning
             # right) turns the picture clockwise. Flip the sign if that turns
             # out backwards against the real wheel.
-            rotated = state["base"].rotate(-angle_deg, resample=Image.BILINEAR if fast else Image.BICUBIC,
-                                           expand=False, fillcolor=self._wheel_fill_rgb)
+            resample = Image.NEAREST if rough else Image.BILINEAR if fast else Image.BICUBIC
+            rotated = state["base"].rotate(-angle_deg, resample=resample, expand=False,
+                                           fillcolor=self._wheel_fill_rgb)
             photo = state["photo"]
             if photo is not None and (photo.width(), photo.height()) == rotated.size:
                 photo.paste(rotated)  # updates the shown image in place
@@ -1783,16 +1789,21 @@ class VolgasApp:
         self._last_wheel_angle = angle
         if getattr(self, "_wheel_draw_timer", None) is None:
             delay = max(0.0, getattr(self, "_wheel_next_draw", 0.0) - time.monotonic())
-            self._wheel_draw_timer = self.root.after(int(delay * 1000), self._draw_moving_wheel)
+            # Windows fires a short timer only on its 15.6 ms tick, so a wait under that isn't worth making.
+            self._wheel_draw_timer = self.root.after(0 if delay < 0.016 else int(delay * 1000), self._draw_moving_wheel)
 
     def _draw_moving_wheel(self):
         self._wheel_draw_timer = None
         start = time.monotonic()
+        previous = getattr(self, "_wheel_last_drawn", None)
+        speed = abs(self._last_wheel_angle - previous[1]) / max(0.001, start - previous[0]) if previous else 0.0
+        self._wheel_last_drawn = (start, self._last_wheel_angle)
+        rough = speed > WHEEL_ROUGH_DEG_PER_S
         for canvas, draw in getattr(self, "_wheel_cards", ()):
             if canvas.winfo_viewable():
-                draw(self._last_wheel_angle, fast=True)
+                draw(self._last_wheel_angle, fast=True, rough=rough)
         cost = time.monotonic() - start
-        self._wheel_next_draw = start + max(1 / 60, 2 * cost)
+        self._wheel_next_draw = start + max(1 / 120, 1.5 * cost)
         if getattr(self, "_wheel_settle_timer", None) is not None:
             self.root.after_cancel(self._wheel_settle_timer)
         self._wheel_settle_timer = self.root.after(WHEEL_SETTLE_MS, self._settle_wheel)
@@ -2897,7 +2908,9 @@ class VolgasApp:
         port and parser; reports a lost link through the queue."""
         while not stop.is_set():
             try:
-                data = ser.read(64)
+                # Wait for one byte, then take whatever has arrived: read(64) would hold the frames back
+                # until 64 bytes or the 50 ms timeout, delivering them in bursts up to 60 ms late.
+                data = ser.read(ser.in_waiting or 1)
             except (serial.SerialException, OSError, TypeError, AttributeError) as e:
                 if not stop.is_set():
                     self.rx_queue.put(("lost", (stop, str(e))))
@@ -3106,7 +3119,7 @@ class VolgasApp:
             self._wb_fw = "{ReleaseMajor}.{ReleaseMinor}.{ReleasePatch}".format(**latest_state)
             self._update_main_wheel(latest_state["Position"])
         if not self._closing:
-            self.root.after(16, self._wb_poll)
+            self.root.after(8, self._wb_poll)
 
     def _adopt_wb_settings(self, settings):
         """Show the board's own values and remember the ones Volgas displays."""
@@ -3138,6 +3151,7 @@ class VolgasApp:
     # ---------- incoming ----------
 
     def _poll(self):
+        latest_status = None   # the pedals send 100 a second: only the newest of a batch needs drawing
         try:
             while True:
                 msg_type, payload = self.rx_queue.get_nowait()
@@ -3148,7 +3162,7 @@ class VolgasApp:
                         self._notify("Lost contact with the pedals. Volgas will reconnect when they're back.",
                                      "warn")
                 elif msg_type == MSG_STATUS and len(payload) == STATUS_SIZE:
-                    self._on_status(struct.unpack(STATUS_FMT, payload))
+                    latest_status = payload
                 elif msg_type == MSG_CALIBRATION and len(payload) == CAL_SIZE:
                     self._on_calibration(struct.unpack(CAL_FMT, payload))
                 elif msg_type == MSG_INFO:
@@ -3165,7 +3179,9 @@ class VolgasApp:
                                      "will be lost when they restart.", "error")
         except queue.Empty:
             pass
-        self.root.after(30, self._poll)
+        if latest_status is not None:
+            self._on_status(struct.unpack(STATUS_FMT, latest_status))
+        self.root.after(8, self._poll)
 
     def _on_pedal_info(self, info):
         """The pedals' firmware version and faults (firmware 1.0 and later). A fault is announced once
@@ -3801,6 +3817,18 @@ DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 PROCESS_SYSTEM_DPI_AWARE = 1
 
 
+def _request_fine_timer():
+    """Windows fires timers on a 15.6 ms tick unless a program asks for finer: Tk's after(8) then ran only 64
+    times a second, so the pedal and wheel updates were polled at half the rate they asked for. Asking for
+    1 ms makes after(8) fire about every 8 ms (measured 122 a second); it's undone when Volgas exits."""
+    try:
+        winmm = ctypes.windll.winmm
+        if winmm.timeBeginPeriod(1) == 0:
+            atexit.register(winmm.timeEndPeriod, 1)
+    except (AttributeError, OSError):
+        pass   # not Windows, or no winmm: the timers just keep their coarse tick
+
+
 def _enable_dpi_awareness():
     """On a scaled display (125%, 150%...) Windows drew this app at 100% and
     stretched the picture, so everything looked fuzzy. Declaring it DPI aware
@@ -3890,6 +3918,7 @@ if __name__ == "__main__":
     log.info("Volgas %s starting (Python %s, %s), log: %s", VOLGAS_VERSION, sys.version.split()[0], sys.platform,
              log_path)
     _enable_dpi_awareness()
+    _request_fine_timer()
     _sync_installed_version()
     root = tk.Tk()
     T.init_scale(root)
